@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: recsys-postgres
+    environment:
+      POSTGRES_USER: recsys
+      POSTGRES_PASSWORD: recsys
+      POSTGRES_DB: recsys
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recsys -d recsys"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    container_name: recsys-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.2
+    container_name: recsys-qdrant
+    ports:
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6334'"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  embedding:
+    build:
+      context: ./embedding
+      dockerfile: Dockerfile
+    container_name: recsys-embedding
+    ports:
+      - "8082:8082"
+    environment:
+      CACHE_DIR: /models
+      ADDR: ":8082"
+      ONNX_PATH: /opt/onnxruntime/lib/libonnxruntime.so
+    volumes:
+      - fastembed_cache:/models
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8082'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+volumes:
+  pg_data:
+  redis_data:
+  qdrant_data:
+  fastembed_cache:
