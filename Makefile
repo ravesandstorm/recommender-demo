@@ -19,7 +19,7 @@ seed: ## Seed posts (JSON → Postgres + embeddings + Qdrant)
 	cd seed && go run .
 
 frontend: ## Install deps and start the Nuxt dev server
-	cd frontend && npm install && npm run dev
+	cd frontend && pnpm install && npm run dev
 
 test: ## Run backend tests (requires compose services healthy)
 	cd backend && go test ./... -count=1 -timeout 180s
