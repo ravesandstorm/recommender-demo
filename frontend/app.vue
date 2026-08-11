@@ -92,6 +92,9 @@ const sentinel = ref<HTMLElement | null>(null)
 
 onMounted(async () => {
   loadFromStorage()
+  if (userId.value && posts.value.length === 0 && !loading.value) {
+    await loadMore()
+  }
   try {
     await refreshUsers()
   } catch (e) {

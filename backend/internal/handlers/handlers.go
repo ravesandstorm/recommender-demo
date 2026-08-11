@@ -95,9 +95,9 @@ func (a *API) GetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"feed_limit":        a.Cfg.FeedLimit,
-		"qdrant_overfetch":  a.Cfg.QdrantOverfetch,
-		"vector_dim":        a.Cfg.VectorDim,
+		"feed_limit":          a.Cfg.FeedLimit,
+		"qdrant_overfetch":    a.Cfg.QdrantOverfetch,
+		"vector_dim":          a.Cfg.VectorDim,
 		"interaction_weights": weights,
 	})
 }
@@ -394,6 +394,24 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if len(posts) < limit {
+			extra, err := a.DB.RecentPosts(ctx, limit)
+			if err == nil {
+				seen := map[uuid.UUID]struct{}{}
+				for _, p := range posts {
+					seen[p.ID] = struct{}{}
+				}
+				for _, p := range extra {
+					if _, ok := seen[p.ID]; ok {
+						continue
+					}
+					posts = append(posts, p)
+					if len(posts) >= limit {
+						break
+					}
+				}
+			}
+		}
 	} else {
 		hits, err := a.Qdrant.Search(ctx, userVec, a.Cfg.QdrantOverfetch)
 		if err != nil {
@@ -418,10 +436,48 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		// backfill if vector search yielded too few after filtering
+		// backfill with unviewed recent posts
 		if len(posts) < limit {
 			need := limit - len(posts)
 			extra, err := a.DB.RecentUnviewed(ctx, userID, need+len(posts))
+			if err == nil {
+				seen := map[uuid.UUID]struct{}{}
+				for _, p := range posts {
+					seen[p.ID] = struct{}{}
+				}
+				for _, p := range extra {
+					if _, ok := seen[p.ID]; ok {
+						continue
+					}
+					posts = append(posts, p)
+					if len(posts) >= limit {
+						break
+					}
+				}
+			}
+		}
+		// if still fewer than limit (unviewed exhausted), backfill with vector candidate posts even if viewed
+		if len(posts) < limit {
+			extra, err := a.DB.GetPostsByIDs(ctx, candidateIDs)
+			if err == nil && len(extra) > 0 {
+				seen := map[uuid.UUID]struct{}{}
+				for _, p := range posts {
+					seen[p.ID] = struct{}{}
+				}
+				for _, p := range extra {
+					if _, ok := seen[p.ID]; ok {
+						continue
+					}
+					posts = append(posts, p)
+					if len(posts) >= limit {
+						break
+					}
+				}
+			}
+		}
+		// if STILL fewer than limit, backfill with recent posts overall
+		if len(posts) < limit {
+			extra, err := a.DB.RecentPosts(ctx, limit)
 			if err == nil {
 				seen := map[uuid.UUID]struct{}{}
 				for _, p := range posts {

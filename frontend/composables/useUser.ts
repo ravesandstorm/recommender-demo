@@ -20,7 +20,7 @@ export function useUser() {
   async function refreshUsers() {
     const api = useApi()
     users.value = await api.listUsers()
-    if (userId.value && !users.value.some(u => u.id === userId.value)) {
+    if (userId.value && users.value.length > 0 && !users.value.some(u => u.id === userId.value)) {
       userId.value = ''
       if (import.meta.client) localStorage.removeItem('recsys_user_id')
     }

@@ -144,6 +144,28 @@ func (s *Store) RecentUnviewed(ctx context.Context, userID uuid.UUID, limit int)
 	return out, rows.Err()
 }
 
+func (s *Store) RecentPosts(ctx context.Context, limit int) ([]Post, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT p.id, p.title, p.content, p.share_count, p.created_at
+		FROM posts p
+		ORDER BY p.created_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Post
+	for rows.Next() {
+		var p Post
+		if err := rows.Scan(&p.ID, &p.Title, &p.Content, &p.ShareCount, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) FilterUnviewed(ctx context.Context, userID uuid.UUID, candidateIDs []uuid.UUID, limit int) ([]uuid.UUID, error) {
 	if len(candidateIDs) == 0 {
 		return nil, nil
