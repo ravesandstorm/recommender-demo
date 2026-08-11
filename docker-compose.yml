@@ -20,7 +20,7 @@ services:
     image: redis:7
     container_name: recsys-redis
     ports:
-      - "6379:6379"
+      - "6380:6380"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -33,7 +33,8 @@ services:
     image: qdrant/qdrant:v1.13.2
     container_name: recsys-qdrant
     ports:
-      - "6334:6334"
+      - "6334:6333"
+      - "6335:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:

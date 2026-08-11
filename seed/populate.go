@@ -23,8 +23,8 @@ type postSeed struct {
 func main() {
 	ctx := context.Background()
 	databaseURL := envOr("DATABASE_URL", "postgres://recsys:recsys@localhost:5432/recsys?sslmode=disable")
-	embeddingURL := envOr("EMBEDDING_URL", "http://localhost:8081")
-	qdrantURL := envOr("QDRANT_URL", "http://localhost:6333")
+	embeddingURL := envOr("EMBEDDING_URL", "http://localhost:8082")
+	qdrantURL := envOr("QDRANT_URL", "http://localhost:6334")
 	collection := envOr("QDRANT_COLLECTION", "posts")
 	jsonPath := envOr("POSTS_JSON", filepath.Join(".", "posts.json"))
 
