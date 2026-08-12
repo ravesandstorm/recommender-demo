@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -18,6 +19,10 @@ type Config struct {
 	InterestK            int
 	InterestSimThreshold float64
 	MMRLambda            float64
+	SeenTTL              time.Duration
+	SeenHydrateLimit     int
+	ViewWriteWorkers     int
+	ViewWriteQueueSize   int
 }
 
 func Load() Config {
@@ -34,6 +39,10 @@ func Load() Config {
 		InterestK:            envInt("INTEREST_K", 5),
 		InterestSimThreshold: envFloat("INTEREST_SIM_THRESHOLD", 0.55),
 		MMRLambda:            envFloat("MMR_LAMBDA", 0.7),
+		SeenTTL:              envDuration("SEEN_TTL", 3*24*time.Hour),
+		SeenHydrateLimit:     envInt("SEEN_HYDRATE_LIMIT", 50),
+		ViewWriteWorkers:     envInt("VIEW_WRITE_WORKERS", 8),
+		ViewWriteQueueSize:   envInt("VIEW_WRITE_QUEUE_SIZE", 4096),
 	}
 }
 
@@ -59,6 +68,16 @@ func envFloat(key string, fallback float64) float64 {
 		n, err := strconv.ParseFloat(v, 64)
 		if err == nil {
 			return n
+		}
+	}
+	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
 		}
 	}
 	return fallback
