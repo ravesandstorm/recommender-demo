@@ -207,6 +207,32 @@ func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid
 	return err
 }
 
+func (s *Store) ListRecentViewedPostIDs(ctx context.Context, userID uuid.UUID, limit int) ([]uuid.UUID, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT post_id
+		FROM post_views
+		WHERE user_id=$1
+		ORDER BY viewed_at DESC
+		LIMIT $2
+	`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) GetWeight(ctx context.Context, interactionType string) (float64, error) {
 	var w float64
 	err := s.Pool.QueryRow(ctx, `SELECT weight FROM interaction_weights WHERE interaction_type=$1`, interactionType).Scan(&w)
