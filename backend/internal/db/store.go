@@ -291,6 +291,17 @@ func (s *Store) ListComments(ctx context.Context, postID uuid.UUID) ([]Comment, 
 	return out, rows.Err()
 }
 
+func (s *Store) InsertShare(ctx context.Context, userID, postID uuid.UUID) (bool, error) {
+	tag, err := s.Pool.Exec(ctx, `
+		INSERT INTO shares (user_id, post_id) VALUES ($1,$2)
+		ON CONFLICT DO NOTHING
+	`, userID, postID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (s *Store) IncrementShare(ctx context.Context, postID uuid.UUID) (int, error) {
 	var count int
 	err := s.Pool.QueryRow(ctx, `
