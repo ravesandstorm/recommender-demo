@@ -43,10 +43,10 @@ func (s *Store) SetUserInterests(ctx context.Context, userID string, interests [
 	return s.client.Set(ctx, interestsKey(userID), raw, 0).Err()
 }
 
-// FlushUserVectors deletes preference keys: legacy vectors and multi-interest profiles.
+// FlushUserVectors deletes preference + seen keys.
 func (s *Store) FlushUserVectors(ctx context.Context) (int, error) {
 	var deleted int
-	for _, pattern := range []string{"user:*:vector", "user:*:interests"} {
+	for _, pattern := range []string{"user:*:vector", "user:*:interests", "user:*:seen"} {
 		var cursor uint64
 		for {
 			keys, next, err := s.client.Scan(ctx, cursor, pattern, 100).Result()
