@@ -21,9 +21,9 @@ func Load() Config {
 	return Config{
 		Addr:             envOr("ADDR", ":8090"),
 		DatabaseURL:      envOr("DATABASE_URL", "postgres://recsys:recsys@localhost:5432/recsys?sslmode=disable"),
-		RedisAddr:        envOr("REDIS_ADDR", "localhost:6379"),
-		QdrantURL:        envOr("QDRANT_URL", "http://localhost:6333"),
-		EmbeddingURL:     envOr("EMBEDDING_URL", "http://localhost:8081"),
+		RedisAddr:        envOr("REDIS_ADDR", "localhost:6380"),
+		QdrantURL:        envOr("QDRANT_URL", "http://localhost:6334"),
+		EmbeddingURL:     envOr("EMBEDDING_URL", "http://localhost:8082"),
 		QdrantCollection: envOr("QDRANT_COLLECTION", "posts"),
 		VectorDim:        envInt("VECTOR_DIM", 384),
 		FeedLimit:        envInt("FEED_LIMIT", 5),
