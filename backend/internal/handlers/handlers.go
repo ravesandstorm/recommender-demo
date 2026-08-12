@@ -94,11 +94,20 @@ func (a *API) GetConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	exploit, soft, hard := feedSlots(a.Cfg.FeedLimit)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"feed_limit":          a.Cfg.FeedLimit,
-		"qdrant_overfetch":    a.Cfg.QdrantOverfetch,
-		"vector_dim":          a.Cfg.VectorDim,
-		"interaction_weights": weights,
+		"feed_limit":             a.Cfg.FeedLimit,
+		"qdrant_overfetch":       a.Cfg.QdrantOverfetch,
+		"vector_dim":             a.Cfg.VectorDim,
+		"interaction_weights":    weights,
+		"interest_k":             a.Cfg.InterestK,
+		"interest_sim_threshold": a.Cfg.InterestSimThreshold,
+		"mmr_lambda":             a.Cfg.MMRLambda,
+		"feed_slots": map[string]int{
+			"exploit":      exploit,
+			"soft_explore": soft,
+			"hard_explore": hard,
+		},
 	})
 }
 
@@ -127,7 +136,8 @@ func (a *API) CreateUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "could not create user (username may be taken)")
 		return
 	}
-	// init zero vector
+	// init empty multi-interest profile (+ blended zero vector for legacy readers)
+	_ = a.Redis.SetUserInterests(r.Context(), u.ID.String(), nil)
 	_ = a.Redis.SetUserVector(r.Context(), u.ID.String(), vector.Zero(a.Cfg.VectorDim))
 	writeJSON(w, http.StatusCreated, u)
 }
@@ -137,24 +147,23 @@ func (a *API) applyVector(ctx context.Context, userID, postID uuid.UUID, interac
 	if err != nil {
 		return err
 	}
+	if subtract {
+		weight = -weight
+	}
 	postVec, err := a.Qdrant.GetVector(ctx, postID.String())
 	if err != nil {
 		return err
 	}
-	userVec, err := a.Redis.GetUserVector(ctx, userID.String())
+	interests, err := a.Redis.GetUserInterests(ctx, userID.String())
 	if err != nil {
 		return err
 	}
-	if len(userVec) != a.Cfg.VectorDim {
-		userVec = vector.Zero(a.Cfg.VectorDim)
+	next := vector.ApplyInterest(interests, postVec, weight, a.Cfg.InterestK, a.Cfg.InterestSimThreshold)
+	if err := a.Redis.SetUserInterests(ctx, userID.String(), next); err != nil {
+		return err
 	}
-	var next []float32
-	if subtract {
-		next = vector.SubScaled(userVec, weight, postVec)
-	} else {
-		next = vector.AddScaled(userVec, weight, postVec)
-	}
-	return a.Redis.SetUserVector(ctx, userID.String(), next)
+	// Keep blended single vector in sync for debugging / legacy cold-start checks.
+	return a.Redis.SetUserVector(ctx, userID.String(), vector.BlendInterests(next, a.Cfg.VectorDim))
 }
 
 func (a *API) setLike(w http.ResponseWriter, r *http.Request, wantLike bool) {
@@ -316,6 +325,17 @@ func (a *API) Share(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+
+	inserted, err := a.DB.InsertShare(ctx, userID, postID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !inserted {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
+		return
+	}
+
 	count, err := a.DB.IncrementShare(ctx, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -373,6 +393,71 @@ func (a *API) CreateComment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, c)
 }
 
+func appendUnique(dst []db.Post, extras []db.Post, limit int, seen map[uuid.UUID]struct{}) []db.Post {
+	for _, p := range extras {
+		if len(dst) >= limit {
+			break
+		}
+		if _, ok := seen[p.ID]; ok {
+			continue
+		}
+		seen[p.ID] = struct{}{}
+		dst = append(dst, p)
+	}
+	return dst
+}
+
+type scoredHit struct {
+	id     uuid.UUID
+	score  float64
+	vector []float32
+}
+
+func (a *API) multiInterestCandidates(ctx context.Context, interests []vector.Interest) ([]scoredHit, error) {
+	weights := make([]float64, len(interests))
+	for i, it := range interests {
+		weights[i] = it.Weight
+	}
+	quotas := vector.AllocateQuotas(weights, a.Cfg.QdrantOverfetch)
+
+	best := map[uuid.UUID]scoredHit{}
+	for i, it := range interests {
+		if quotas[i] <= 0 || vector.IsZero(it.Vector) {
+			continue
+		}
+		hits, err := a.Qdrant.Search(ctx, it.Vector, quotas[i])
+		if err != nil {
+			return nil, err
+		}
+		for _, h := range hits {
+			id, err := uuid.Parse(h.ID)
+			if err != nil {
+				continue
+			}
+			// Weight ANN score by interest mass so stronger tastes dominate ties.
+			rel := h.Score * it.Weight
+			if prev, ok := best[id]; ok && prev.score >= rel {
+				continue
+			}
+			best[id] = scoredHit{id: id, score: rel, vector: h.Vector}
+		}
+	}
+
+	out := make([]scoredHit, 0, len(best))
+	for _, h := range best {
+		out = append(out, h)
+	}
+	// Stable-ish: higher relevance first.
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].score > out[i].score {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out, nil
+}
+
 func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 	userID, ok := a.requireUser(w, r)
 	if !ok {
@@ -381,14 +466,25 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit := a.Cfg.FeedLimit
 
-	userVec, err := a.Redis.GetUserVector(ctx, userID.String())
+	interests, err := a.Redis.GetUserInterests(ctx, userID.String())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Legacy fallback: single blended vector from before multi-interest.
+	if !vector.HasInterests(interests) {
+		userVec, err := a.Redis.GetUserVector(ctx, userID.String())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !vector.IsZero(userVec) {
+			interests = []vector.Interest{{Vector: vector.L2Normalize(userVec), Weight: 1}}
+		}
+	}
 
 	var posts []db.Post
-	if vector.IsZero(userVec) {
+	if !vector.HasInterests(interests) {
 		posts, err = a.DB.RecentUnviewed(ctx, userID, limit)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
@@ -401,97 +497,116 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 				for _, p := range posts {
 					seen[p.ID] = struct{}{}
 				}
-				for _, p := range extra {
-					if _, ok := seen[p.ID]; ok {
-						continue
-					}
-					posts = append(posts, p)
-					if len(posts) >= limit {
-						break
-					}
-				}
+				posts = appendUnique(posts, extra, limit, seen)
 			}
 		}
 	} else {
-		hits, err := a.Qdrant.Search(ctx, userVec, a.Cfg.QdrantOverfetch)
+		hits, err := a.multiInterestCandidates(ctx, interests)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+
 		candidateIDs := make([]uuid.UUID, 0, len(hits))
+		hitByID := make(map[uuid.UUID]scoredHit, len(hits))
 		for _, h := range hits {
-			id, err := uuid.Parse(h.ID)
+			candidateIDs = append(candidateIDs, h.id)
+			hitByID[h.id] = h
+		}
+
+		ranked, err := a.DB.FilterUnviewed(ctx, userID, candidateIDs, len(candidateIDs))
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		exploitN, softN, hardN := feedSlots(limit)
+		personalN := exploitN + softN
+
+		mmrIn := make([]vector.MMRCandidate, 0, len(ranked))
+		for _, id := range ranked {
+			h, ok := hitByID[id]
+			if !ok {
+				continue
+			}
+			mmrIn = append(mmrIn, vector.MMRCandidate{
+				ID:        id.String(),
+				Relevance: h.score,
+				Vector:    h.vector,
+			})
+		}
+		mmrOut := vector.MMR(mmrIn, personalN, a.Cfg.MMRLambda)
+
+		used := make(map[uuid.UUID]struct{}, limit)
+		selectedIDs := make([]uuid.UUID, 0, limit)
+		for _, c := range mmrOut {
+			id, err := uuid.Parse(c.ID)
 			if err != nil {
 				continue
 			}
-			candidateIDs = append(candidateIDs, id)
+			used[id] = struct{}{}
+			selectedIDs = append(selectedIDs, id)
 		}
-		filtered, err := a.DB.FilterUnviewed(ctx, userID, candidateIDs, limit)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
+
+		// Soft explore leftover: if MMR under-filled, pull from lower similarity band.
+		if len(selectedIDs) < personalN {
+			need := personalN - len(selectedIDs)
+			selectedIDs = append(selectedIDs, pickSoftExplore(ranked, need, used)...)
 		}
-		posts, err = a.DB.GetPostsByIDs(ctx, filtered)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
+
+		annSet := make(map[uuid.UUID]struct{}, len(candidateIDs))
+		for _, id := range candidateIDs {
+			annSet[id] = struct{}{}
 		}
-		// backfill with unviewed recent posts
-		if len(posts) < limit {
-			need := limit - len(posts)
-			extra, err := a.DB.RecentUnviewed(ctx, userID, need+len(posts))
+		if hardN > 0 {
+			recent, err := a.DB.RecentUnviewed(ctx, userID, a.Cfg.QdrantOverfetch)
 			if err == nil {
-				seen := map[uuid.UUID]struct{}{}
-				for _, p := range posts {
-					seen[p.ID] = struct{}{}
-				}
-				for _, p := range extra {
-					if _, ok := seen[p.ID]; ok {
-						continue
-					}
-					posts = append(posts, p)
-					if len(posts) >= limit {
+				for _, p := range recent {
+					if len(selectedIDs) >= limit {
 						break
 					}
+					if _, ok := used[p.ID]; ok {
+						continue
+					}
+					if _, inANN := annSet[p.ID]; inANN {
+						continue
+					}
+					used[p.ID] = struct{}{}
+					selectedIDs = append(selectedIDs, p.ID)
 				}
 			}
 		}
-		// if still fewer than limit (unviewed exhausted), backfill with vector candidate posts even if viewed
+
+		if len(selectedIDs) < limit {
+			selectedIDs = append(selectedIDs, pickFromFront(ranked, limit-len(selectedIDs), used)...)
+		}
+
+		posts, err = a.DB.GetPostsByIDs(ctx, selectedIDs)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		seen := map[uuid.UUID]struct{}{}
+		for _, p := range posts {
+			seen[p.ID] = struct{}{}
+		}
+		if len(posts) < limit {
+			extra, err := a.DB.RecentUnviewed(ctx, userID, limit)
+			if err == nil {
+				posts = appendUnique(posts, extra, limit, seen)
+			}
+		}
 		if len(posts) < limit {
 			extra, err := a.DB.GetPostsByIDs(ctx, candidateIDs)
-			if err == nil && len(extra) > 0 {
-				seen := map[uuid.UUID]struct{}{}
-				for _, p := range posts {
-					seen[p.ID] = struct{}{}
-				}
-				for _, p := range extra {
-					if _, ok := seen[p.ID]; ok {
-						continue
-					}
-					posts = append(posts, p)
-					if len(posts) >= limit {
-						break
-					}
-				}
+			if err == nil {
+				posts = appendUnique(posts, extra, limit, seen)
 			}
 		}
-		// if STILL fewer than limit, backfill with recent posts overall
 		if len(posts) < limit {
 			extra, err := a.DB.RecentPosts(ctx, limit)
 			if err == nil {
-				seen := map[uuid.UUID]struct{}{}
-				for _, p := range posts {
-					seen[p.ID] = struct{}{}
-				}
-				for _, p := range extra {
-					if _, ok := seen[p.ID]; ok {
-						continue
-					}
-					posts = append(posts, p)
-					if len(posts) >= limit {
-						break
-					}
-				}
+				posts = appendUnique(posts, extra, limit, seen)
 			}
 		}
 	}

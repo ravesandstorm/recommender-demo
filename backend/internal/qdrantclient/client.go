@@ -128,8 +128,9 @@ func (c *Client) GetVector(ctx context.Context, postID string) ([]float32, error
 }
 
 type SearchHit struct {
-	ID    string
-	Score float64
+	ID     string
+	Score  float64
+	Vector []float32
 }
 
 func (c *Client) Search(ctx context.Context, vector []float32, limit int) ([]SearchHit, error) {
@@ -137,6 +138,7 @@ func (c *Client) Search(ctx context.Context, vector []float32, limit int) ([]Sea
 		"vector":       vector,
 		"limit":        limit,
 		"with_payload": true,
+		"with_vector":  true,
 	}
 	raw, _ := json.Marshal(body)
 	url := fmt.Sprintf("%s/collections/%s/points/search", c.baseURL, c.collection)
@@ -156,8 +158,9 @@ func (c *Client) Search(ctx context.Context, vector []float32, limit int) ([]Sea
 
 	var out struct {
 		Result []struct {
-			ID      any     `json:"id"`
-			Score   float64 `json:"score"`
+			ID      any       `json:"id"`
+			Score   float64   `json:"score"`
+			Vector  []float32 `json:"vector"`
 			Payload struct {
 				PostID string `json:"post_id"`
 			} `json:"payload"`
@@ -173,7 +176,7 @@ func (c *Client) Search(ctx context.Context, vector []float32, limit int) ([]Sea
 		if id == "" {
 			id = stringifyID(r.ID)
 		}
-		hits = append(hits, SearchHit{ID: id, Score: r.Score})
+		hits = append(hits, SearchHit{ID: id, Score: r.Score, Vector: r.Vector})
 	}
 	return hits, nil
 }
