@@ -20,7 +20,7 @@ services:
     image: redis:7
     container_name: recsys-redis
     ports:
-      - "6380:6380"
+      - "6380:6379"
     volumes:
       - redis_data:/data
     healthcheck:

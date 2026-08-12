@@ -21,5 +21,8 @@ seed: ## Seed posts (JSON → Postgres + embeddings + Qdrant)
 frontend: ## Install deps and start the Nuxt dev server
 	cd frontend && pnpm install && npm run dev
 
+flush: ## flush redis cache
+	docker exec -it $$(docker ps -q --filter "publish=6380") redis-cli FLUSHALL
+
 test: ## Run backend tests (requires compose services healthy)
 	cd backend && go test ./... -count=1 -timeout 180s
