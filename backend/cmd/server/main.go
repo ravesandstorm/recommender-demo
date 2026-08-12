@@ -19,6 +19,7 @@ import (
 	"github.com/recsys/backend/internal/migrate"
 	"github.com/recsys/backend/internal/qdrantclient"
 	"github.com/recsys/backend/internal/redisstore"
+	"github.com/recsys/backend/internal/viewwriter"
 )
 
 func main() {
@@ -47,6 +48,7 @@ func main() {
 	}
 
 	embed := embedclient.New(cfg.EmbeddingURL)
+	views := viewwriter.New(store, cfg.ViewWriteWorkers, cfg.ViewWriteQueueSize)
 
 	api := &handlers.API{
 		Cfg:    cfg,
@@ -54,6 +56,7 @@ func main() {
 		Redis:  rdb,
 		Qdrant: qdrant,
 		Embed:  embed,
+		Views:  views,
 	}
 
 	r := chi.NewRouter()
@@ -83,4 +86,5 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+	views.Close()
 }

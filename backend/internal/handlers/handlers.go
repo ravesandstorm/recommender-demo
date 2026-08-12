@@ -13,6 +13,7 @@ import (
 	"github.com/recsys/backend/internal/qdrantclient"
 	"github.com/recsys/backend/internal/redisstore"
 	"github.com/recsys/backend/internal/vector"
+	"github.com/recsys/backend/internal/viewwriter"
 )
 
 type API struct {
@@ -21,6 +22,7 @@ type API struct {
 	Redis  *redisstore.Store
 	Qdrant *qdrantclient.Client
 	Embed  *embedclient.Client
+	Views  *viewwriter.Writer
 }
 
 func (a *API) Routes() http.Handler {
@@ -103,6 +105,8 @@ func (a *API) GetConfig(w http.ResponseWriter, r *http.Request) {
 		"interest_k":             a.Cfg.InterestK,
 		"interest_sim_threshold": a.Cfg.InterestSimThreshold,
 		"mmr_lambda":             a.Cfg.MMRLambda,
+		"seen_ttl_seconds":       int(a.Cfg.SeenTTL.Seconds()),
+		"seen_hydrate_limit":     a.Cfg.SeenHydrateLimit,
 		"feed_slots": map[string]int{
 			"exploit":      exploit,
 			"soft_explore": soft,
@@ -407,6 +411,80 @@ func appendUnique(dst []db.Post, extras []db.Post, limit int, seen map[uuid.UUID
 	return dst
 }
 
+func uuidsToStrings(ids []uuid.UUID) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = id.String()
+	}
+	return out
+}
+
+func stringsToUUIDs(ids []string) []uuid.UUID {
+	out := make([]uuid.UUID, 0, len(ids))
+	for _, s := range ids {
+		id, err := uuid.Parse(s)
+		if err != nil {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func (a *API) ensureSeenLoaded(ctx context.Context, userID uuid.UUID) error {
+	return a.Redis.EnsureSeen(ctx, userID.String(), a.Cfg.SeenTTL, func(ctx context.Context) ([]string, error) {
+		ids, err := a.DB.ListRecentViewedPostIDs(ctx, userID, a.Cfg.SeenHydrateLimit)
+		if err != nil {
+			return nil, err
+		}
+		return uuidsToStrings(ids), nil
+	})
+}
+
+func (a *API) filterUnseenUUIDs(ctx context.Context, userID uuid.UUID, ids []uuid.UUID) ([]uuid.UUID, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	unseen, err := a.Redis.FilterUnseen(ctx, userID.String(), uuidsToStrings(ids))
+	if err != nil {
+		return nil, err
+	}
+	return stringsToUUIDs(unseen), nil
+}
+
+func (a *API) recentUnseenPosts(ctx context.Context, userID uuid.UUID, limit int) ([]db.Post, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	// Over-fetch then filter in Redis to avoid Postgres anti-join on the hot path.
+	fetch := limit * 4
+	if fetch < a.Cfg.QdrantOverfetch {
+		fetch = a.Cfg.QdrantOverfetch
+	}
+	recent, err := a.DB.RecentPosts(ctx, fetch)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]uuid.UUID, len(recent))
+	byID := make(map[uuid.UUID]db.Post, len(recent))
+	for i, p := range recent {
+		ids[i] = p.ID
+		byID[p.ID] = p
+	}
+	unseen, err := a.filterUnseenUUIDs(ctx, userID, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]db.Post, 0, limit)
+	for _, id := range unseen {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, byID[id])
+	}
+	return out, nil
+}
+
 type scoredHit struct {
 	id     uuid.UUID
 	score  float64
@@ -466,6 +544,11 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit := a.Cfg.FeedLimit
 
+	if err := a.ensureSeenLoaded(ctx, userID); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	interests, err := a.Redis.GetUserInterests(ctx, userID.String())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -485,7 +568,7 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 
 	var posts []db.Post
 	if !vector.HasInterests(interests) {
-		posts, err = a.DB.RecentUnviewed(ctx, userID, limit)
+		posts, err = a.recentUnseenPosts(ctx, userID, limit)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -514,7 +597,7 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 			hitByID[h.id] = h
 		}
 
-		ranked, err := a.DB.FilterUnviewed(ctx, userID, candidateIDs, len(candidateIDs))
+		ranked, err := a.filterUnseenUUIDs(ctx, userID, candidateIDs)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -559,7 +642,7 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 			annSet[id] = struct{}{}
 		}
 		if hardN > 0 {
-			recent, err := a.DB.RecentUnviewed(ctx, userID, a.Cfg.QdrantOverfetch)
+			recent, err := a.recentUnseenPosts(ctx, userID, a.Cfg.QdrantOverfetch)
 			if err == nil {
 				for _, p := range recent {
 					if len(selectedIDs) >= limit {
@@ -592,7 +675,7 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 			seen[p.ID] = struct{}{}
 		}
 		if len(posts) < limit {
-			extra, err := a.DB.RecentUnviewed(ctx, userID, limit)
+			extra, err := a.recentUnseenPosts(ctx, userID, limit)
 			if err == nil {
 				posts = appendUnique(posts, extra, limit, seen)
 			}
@@ -615,7 +698,11 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 	for _, p := range posts {
 		ids = append(ids, p.ID)
 	}
-	_ = a.DB.MarkViewed(ctx, userID, ids)
+	// Hot path: sync Redis seen. Durable PG write is async via bounded workers.
+	_ = a.Redis.MarkSeen(ctx, userID.String(), uuidsToStrings(ids), a.Cfg.SeenTTL)
+	if a.Views != nil {
+		a.Views.Enqueue(userID, ids)
+	}
 
 	type feedPost struct {
 		ID      uuid.UUID `json:"id"`
