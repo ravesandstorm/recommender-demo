@@ -24,9 +24,9 @@ frontend: ## Install deps and start the Nuxt dev server
 flush: ## Flush entire Redis DB
 	docker exec $$(docker ps -q --filter "publish=6380") redis-cli FLUSHALL
 
-flush-prefs: ## Wipe user preference vectors + multi-interest profiles
+flush-prefs: ## Wipe user preference vectors, interests, and seen sets
 	docker exec $$(docker ps -q --filter "publish=6380") sh -c '\
-		for pat in "user:*:vector" "user:*:interests"; do \
+		for pat in "user:*:vector" "user:*:interests" "user:*:seen"; do \
 			redis-cli --scan --pattern "$$pat" | while read -r k; do \
 				[ -n "$$k" ] && redis-cli DEL "$$k" >/dev/null; \
 			done; \
