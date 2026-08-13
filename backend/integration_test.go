@@ -261,7 +261,7 @@ func TestFeedFiltersViewed(t *testing.T) {
 	p2, err := store.InsertPost(ctx, "B", "content b "+uuid.New().String())
 	require.NoError(t, err)
 
-	require.NoError(t, store.MarkViewed(ctx, user.ID, []uuid.UUID{p1.ID}))
+	require.NoError(t, store.MarkViewed(ctx, user.ID, []uuid.UUID{p1.ID}, cfg.ViewRetainLimit))
 	posts, err := store.RecentUnviewed(ctx, user.ID, 50)
 	require.NoError(t, err)
 	for _, p := range posts {

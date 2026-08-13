@@ -16,23 +16,28 @@ type job struct {
 
 // Writer persists feed impressions to Postgres via a bounded worker pool.
 type Writer struct {
-	db      *db.Store
-	ch      chan job
-	wg      sync.WaitGroup
-	dropped int64
-	mu      sync.Mutex
+	db           *db.Store
+	ch           chan job
+	wg           sync.WaitGroup
+	dropped      int64
+	mu           sync.Mutex
+	retainLimit  int
 }
 
-func New(store *db.Store, workers, queueSize int) *Writer {
+func New(store *db.Store, workers, queueSize, retainLimit int) *Writer {
 	if workers < 1 {
 		workers = 1
 	}
 	if queueSize < 1 {
 		queueSize = 1
 	}
+	if retainLimit < 1 {
+		retainLimit = 1
+	}
 	w := &Writer{
-		db: store,
-		ch: make(chan job, queueSize),
+		db:          store,
+		ch:          make(chan job, queueSize),
+		retainLimit: retainLimit,
 	}
 	for i := 0; i < workers; i++ {
 		w.wg.Add(1)
@@ -45,7 +50,7 @@ func (w *Writer) loop() {
 	defer w.wg.Done()
 	for j := range w.ch {
 		ctx := context.Background()
-		if err := w.db.MarkViewed(ctx, j.userID, j.postIDs); err != nil {
+		if err := w.db.MarkViewed(ctx, j.userID, j.postIDs, w.retainLimit); err != nil {
 			log.Printf("viewwriter: mark viewed: %v", err)
 		}
 	}
