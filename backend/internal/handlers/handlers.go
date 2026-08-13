@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -14,6 +15,7 @@ import (
 	"github.com/recsys/backend/internal/redisstore"
 	"github.com/recsys/backend/internal/vector"
 	"github.com/recsys/backend/internal/viewwriter"
+	"golang.org/x/sync/errgroup"
 )
 
 type API struct {
@@ -105,8 +107,14 @@ func (a *API) GetConfig(w http.ResponseWriter, r *http.Request) {
 		"interest_k":             a.Cfg.InterestK,
 		"interest_sim_threshold": a.Cfg.InterestSimThreshold,
 		"mmr_lambda":             a.Cfg.MMRLambda,
+		"mmr_candidate_cap":      a.Cfg.MMRCandidateCap,
+		"interest_collinear_min": a.Cfg.InterestCollinearMin,
 		"seen_ttl_seconds":       int(a.Cfg.SeenTTL.Seconds()),
 		"seen_hydrate_limit":     a.Cfg.SeenHydrateLimit,
+		"view_retain_limit":      a.Cfg.ViewRetainLimit,
+		"share_memo_ttl_seconds": int(a.Cfg.ShareMemoTTL.Seconds()),
+		"recent_cache_ttl_seconds": int(a.Cfg.RecentCacheTTL.Seconds()),
+		"recent_cache_size":      a.Cfg.RecentCacheSize,
 		"feed_slots": map[string]int{
 			"exploit":      exploit,
 			"soft_explore": soft,
@@ -329,12 +337,26 @@ func (a *API) Share(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	uid := userID.String()
+	pid := postID.String()
+
+	memoHit, err := a.Redis.HasShareMemo(ctx, uid, pid)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if memoHit {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
+		return
+	}
 
 	inserted, err := a.DB.InsertShare(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Memo whether newly inserted or already in PG (conflict).
+	_ = a.Redis.SetShareMemo(ctx, uid, pid, a.Cfg.ShareMemoTTL)
 	if !inserted {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
 		return
@@ -461,10 +483,38 @@ func (a *API) recentUnseenPosts(ctx context.Context, userID uuid.UUID, limit int
 	if fetch < a.Cfg.QdrantOverfetch {
 		fetch = a.Cfg.QdrantOverfetch
 	}
-	recent, err := a.DB.RecentPosts(ctx, fetch)
-	if err != nil {
-		return nil, err
+	cacheSize := a.Cfg.RecentCacheSize
+	if cacheSize < fetch {
+		cacheSize = fetch
 	}
+
+	var recent []db.Post
+	cached, err := a.Redis.GetRecentIDs(ctx)
+	if err == nil && len(cached) >= fetch {
+		ids := stringsToUUIDs(cached)
+		if len(ids) > fetch {
+			ids = ids[:fetch]
+		}
+		recent, err = a.DB.GetPostsByIDs(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(recent) < fetch {
+		recent, err = a.DB.RecentPosts(ctx, cacheSize)
+		if err != nil {
+			return nil, err
+		}
+		idStrs := make([]string, len(recent))
+		for i, p := range recent {
+			idStrs[i] = p.ID.String()
+		}
+		_ = a.Redis.SetRecentIDs(ctx, idStrs, cacheSize, a.Cfg.RecentCacheTTL)
+		if len(recent) > fetch {
+			recent = recent[:fetch]
+		}
+	}
+
 	ids := make([]uuid.UUID, len(recent))
 	byID := make(map[uuid.UUID]db.Post, len(recent))
 	for i, p := range recent {
@@ -492,28 +542,22 @@ type scoredHit struct {
 }
 
 func (a *API) multiInterestCandidates(ctx context.Context, interests []vector.Interest) ([]scoredHit, error) {
-	weights := make([]float64, len(interests))
-	for i, it := range interests {
-		weights[i] = it.Weight
+	active := vector.ActiveInterests(interests)
+	if len(active) == 0 {
+		return nil, nil
 	}
-	quotas := vector.AllocateQuotas(weights, a.Cfg.QdrantOverfetch)
 
 	best := map[uuid.UUID]scoredHit{}
-	for i, it := range interests {
-		if quotas[i] <= 0 || vector.IsZero(it.Vector) {
-			continue
-		}
-		hits, err := a.Qdrant.Search(ctx, it.Vector, quotas[i])
-		if err != nil {
-			return nil, err
-		}
+	var mu sync.Mutex
+	merge := func(hits []qdrantclient.SearchHit, weight float64) {
+		mu.Lock()
+		defer mu.Unlock()
 		for _, h := range hits {
 			id, err := uuid.Parse(h.ID)
 			if err != nil {
 				continue
 			}
-			// Weight ANN score by interest mass so stronger tastes dominate ties.
-			rel := h.Score * it.Weight
+			rel := h.Score * weight
 			if prev, ok := best[id]; ok && prev.score >= rel {
 				continue
 			}
@@ -521,11 +565,64 @@ func (a *API) multiInterestCandidates(ctx context.Context, interests []vector.In
 		}
 	}
 
+	if vector.ShouldCollapseInterests(active, a.Cfg.InterestCollinearMin) {
+		q := active[0].Vector
+		w := active[0].Weight
+		if len(active) > 1 {
+			q = vector.BlendInterests(active, a.Cfg.VectorDim)
+			w = 0
+			for _, it := range active {
+				w += it.Weight
+			}
+			if w <= 0 {
+				w = 1
+			}
+		}
+		hits, err := a.Qdrant.Search(ctx, q, a.Cfg.QdrantOverfetch)
+		if err != nil {
+			return nil, err
+		}
+		merge(hits, w)
+	} else {
+		weights := make([]float64, len(active))
+		for i, it := range active {
+			weights[i] = it.Weight
+		}
+		perInterest := a.Cfg.QdrantOverfetch / len(active)
+		minPer := a.Cfg.FeedLimit * 3
+		if perInterest < minPer {
+			perInterest = minPer
+		}
+		totalSlots := perInterest * len(active)
+		if totalSlots < a.Cfg.QdrantOverfetch {
+			totalSlots = a.Cfg.QdrantOverfetch
+		}
+		quotas := vector.AllocateQuotas(weights, totalSlots)
+
+		g, gctx := errgroup.WithContext(ctx)
+		for i, it := range active {
+			if quotas[i] <= 0 || vector.IsZero(it.Vector) {
+				continue
+			}
+			i, it := i, it
+			g.Go(func() error {
+				hits, err := a.Qdrant.Search(gctx, it.Vector, quotas[i])
+				if err != nil {
+					return err
+				}
+				merge(hits, it.Weight)
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+	}
+
 	out := make([]scoredHit, 0, len(best))
 	for _, h := range best {
 		out = append(out, h)
 	}
-	// Stable-ish: higher relevance first.
 	for i := 0; i < len(out); i++ {
 		for j := i + 1; j < len(out); j++ {
 			if out[j].score > out[i].score {
@@ -618,17 +715,28 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 				Vector:    h.vector,
 			})
 		}
-		mmrOut := vector.MMR(mmrIn, personalN, a.Cfg.MMRLambda)
 
 		used := make(map[uuid.UUID]struct{}, limit)
 		selectedIDs := make([]uuid.UUID, 0, limit)
-		for _, c := range mmrOut {
-			id, err := uuid.Parse(c.ID)
-			if err != nil {
-				continue
+		if personalN <= 2 {
+			selectedIDs = append(selectedIDs, pickFromFront(ranked, personalN, used)...)
+		} else {
+			capN := a.Cfg.MMRCandidateCap
+			if capN < 1 {
+				capN = 1
 			}
-			used[id] = struct{}{}
-			selectedIDs = append(selectedIDs, id)
+			if len(mmrIn) > capN {
+				mmrIn = mmrIn[:capN]
+			}
+			mmrOut := vector.MMR(mmrIn, personalN, a.Cfg.MMRLambda)
+			for _, c := range mmrOut {
+				id, err := uuid.Parse(c.ID)
+				if err != nil {
+					continue
+				}
+				used[id] = struct{}{}
+				selectedIDs = append(selectedIDs, id)
+			}
 		}
 
 		// Soft explore leftover: if MMR under-filled, pull from lower similarity band.
