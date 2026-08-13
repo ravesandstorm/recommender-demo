@@ -51,7 +51,7 @@ func TestSeenFilterMarkAndHydrate(t *testing.T) {
 	// Durable PG row + delete Redis key → hydrate restores filter.
 	post, err := store.InsertPost(ctx, "Seen", "hydrate "+uuid.New().String())
 	require.NoError(t, err)
-	require.NoError(t, store.MarkViewed(ctx, user.ID, []uuid.UUID{post.ID}))
+	require.NoError(t, store.MarkViewed(ctx, user.ID, []uuid.UUID{post.ID}, cfg.ViewRetainLimit))
 	require.NoError(t, rdb.DeleteSeenKey(ctx, userID))
 
 	require.NoError(t, rdb.EnsureSeen(ctx, userID, ttl, func(ctx context.Context) ([]string, error) {

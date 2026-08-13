@@ -195,16 +195,91 @@ func (s *Store) FilterUnviewed(ctx context.Context, userID uuid.UUID, candidateI
 	return out, rows.Err()
 }
 
-func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid.UUID) error {
+// MarkViewed inserts new view rows, increments posts.view_count for those inserts,
+// then trims the user's post_views to at most retainLimit newest rows.
+func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid.UUID, retainLimit int) error {
 	if len(postIDs) == 0 {
 		return nil
 	}
-	_, err := s.Pool.Exec(ctx, `
+	if retainLimit < 1 {
+		retainLimit = 1
+	}
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
 		INSERT INTO post_views (user_id, post_id)
 		SELECT $1, x FROM unnest($2::uuid[]) AS x
 		ON CONFLICT DO NOTHING
+		RETURNING post_id
 	`, userID, postIDs)
-	return err
+	if err != nil {
+		return err
+	}
+	var inserted []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		inserted = append(inserted, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(inserted) > 0 {
+		_, err = tx.Exec(ctx, `
+			UPDATE posts SET view_count = view_count + 1
+			WHERE id = ANY($1)
+		`, inserted)
+		if err != nil {
+			return err
+		}
+	}
+
+	var total int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM post_views WHERE user_id=$1
+	`, userID).Scan(&total); err != nil {
+		return err
+	}
+	if excess := total - retainLimit; excess > 0 {
+		_, err = tx.Exec(ctx, `
+			DELETE FROM post_views
+			WHERE ctid IN (
+				SELECT ctid FROM post_views
+				WHERE user_id=$1
+				ORDER BY viewed_at ASC
+				LIMIT $2
+			)
+		`, userID, excess)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// CountUserViews returns how many post_views rows exist for the user.
+func (s *Store) CountUserViews(ctx context.Context, userID uuid.UUID) (int, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM post_views WHERE user_id=$1`, userID).Scan(&n)
+	return n, err
+}
+
+// GetPostViewCount returns posts.view_count for a post.
+func (s *Store) GetPostViewCount(ctx context.Context, postID uuid.UUID) (int, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx, `SELECT view_count FROM posts WHERE id=$1`, postID).Scan(&n)
+	return n, err
 }
 
 func (s *Store) ListRecentViewedPostIDs(ctx context.Context, userID uuid.UUID, limit int) ([]uuid.UUID, error) {
