@@ -79,3 +79,56 @@ func TestMMRPrefersDiversity(t *testing.T) {
 	require.True(t, ids["a"])
 	require.True(t, ids["c"], "MMR should prefer diverse c over near-duplicate b")
 }
+
+func TestShouldCollapseInterests(t *testing.T) {
+	a := vector.L2Normalize([]float32{1, 0, 0})
+	b := vector.L2Normalize([]float32{0.99, 0.01, 0})
+	c := vector.L2Normalize([]float32{0, 1, 0})
+
+	require.True(t, vector.ShouldCollapseInterests(nil, 0.9))
+	require.True(t, vector.ShouldCollapseInterests([]vector.Interest{{Vector: a, Weight: 1}}, 0.9))
+	require.True(t, vector.ShouldCollapseInterests([]vector.Interest{
+		{Vector: a, Weight: 1},
+		{Vector: b, Weight: 1},
+	}, 0.9))
+	require.False(t, vector.ShouldCollapseInterests([]vector.Interest{
+		{Vector: a, Weight: 1},
+		{Vector: c, Weight: 1},
+	}, 0.9))
+}
+
+func TestApplyInterestNearIdenticalEarlyStop(t *testing.T) {
+	v1 := vector.L2Normalize([]float32{1, 0, 0})
+	v2 := vector.L2Normalize([]float32{0, 1, 0})
+	interests := []vector.Interest{
+		{Vector: v1, Weight: 1},
+		{Vector: v2, Weight: 1},
+	}
+	// Exact match to first centroid should update weight without spawning.
+	next := vector.ApplyInterest(interests, v1, 1.0, 3, 0.55)
+	require.Len(t, next, 2)
+	require.InDelta(t, 2.0, next[0].Weight, 1e-6)
+}
+
+func TestMMRCandidateCapPreservesDiversity(t *testing.T) {
+	cands := make([]vector.MMRCandidate, 0, 10)
+	cands = append(cands,
+		vector.MMRCandidate{ID: "a", Relevance: 1.0, Vector: []float32{1, 0}},
+		vector.MMRCandidate{ID: "b", Relevance: 0.95, Vector: []float32{0.99, 0.01}},
+		vector.MMRCandidate{ID: "c", Relevance: 0.6, Vector: []float32{0, 1}},
+	)
+	for i := 0; i < 7; i++ {
+		cands = append(cands, vector.MMRCandidate{
+			ID:        string(rune('d' + i)),
+			Relevance: 0.5 - float64(i)*0.01,
+			Vector:    []float32{0.98, 0.02},
+		})
+	}
+	capped := cands[:3] // MMR_CANDIDATE_CAP style
+	picked := vector.MMR(capped, 2, 0.5)
+	require.Len(t, picked, 2)
+	ids := map[string]bool{picked[0].ID: true, picked[1].ID: true}
+	require.True(t, ids["a"])
+	require.True(t, ids["c"])
+}
+
