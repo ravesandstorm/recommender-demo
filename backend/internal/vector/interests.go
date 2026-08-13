@@ -31,6 +31,10 @@ func ApplyInterest(interests []Interest, postVec []float32, weight float64, maxK
 			bestSim = sim
 			bestIdx = i
 		}
+		// Near-identical direction: no need to scan remaining centroids.
+		if sim >= 0.999 {
+			break
+		}
 	}
 
 	// Spawn a new interest for positive evidence that is far from existing centroids.
@@ -79,12 +83,35 @@ func BlendInterests(interests []Interest, dim int) []float32 {
 
 // HasInterests reports whether the profile has at least one usable centroid.
 func HasInterests(interests []Interest) bool {
+	return len(ActiveInterests(interests)) > 0
+}
+
+// ActiveInterests returns centroids with positive mass and non-zero vectors.
+func ActiveInterests(interests []Interest) []Interest {
+	out := make([]Interest, 0, len(interests))
 	for _, it := range interests {
 		if it.Weight > weightEpsilon && !IsZero(it.Vector) {
-			return true
+			out = append(out, it)
 		}
 	}
-	return false
+	return out
+}
+
+// ShouldCollapseInterests is true when ANN can use a single query:
+// one active interest, or all pairwise cosines >= minCosine.
+func ShouldCollapseInterests(interests []Interest, minCosine float64) bool {
+	active := ActiveInterests(interests)
+	if len(active) <= 1 {
+		return true
+	}
+	for i := 0; i < len(active); i++ {
+		for j := i + 1; j < len(active); j++ {
+			if Cosine(active[i].Vector, active[j].Vector) < minCosine {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // AllocateQuotas distributes total slots across interests proportional to weight (min 1 if weight > 0).
