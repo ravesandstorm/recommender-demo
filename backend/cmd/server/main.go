@@ -48,7 +48,7 @@ func main() {
 	}
 
 	embed := embedclient.New(cfg.EmbeddingURL)
-	views := viewwriter.New(store, cfg.ViewWriteWorkers, cfg.ViewWriteQueueSize)
+	views := viewwriter.New(store, cfg.ViewWriteWorkers, cfg.ViewWriteQueueSize, cfg.ViewRetainLimit)
 
 	api := &handlers.API{
 		Cfg:    cfg,
