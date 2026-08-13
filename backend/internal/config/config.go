@@ -7,25 +7,36 @@ import (
 )
 
 type Config struct {
-	Addr                 string
-	DatabaseURL          string
-	RedisAddr            string
-	QdrantURL            string
-	EmbeddingURL         string
-	QdrantCollection     string
-	VectorDim            int
-	FeedLimit            int
-	QdrantOverfetch      int
-	InterestK            int
-	InterestSimThreshold float64
-	MMRLambda            float64
-	SeenTTL              time.Duration
-	SeenHydrateLimit     int
-	ViewWriteWorkers     int
-	ViewWriteQueueSize   int
+	Addr                  string
+	DatabaseURL           string
+	RedisAddr             string
+	QdrantURL             string
+	EmbeddingURL          string
+	QdrantCollection      string
+	VectorDim             int
+	FeedLimit             int
+	QdrantOverfetch       int
+	InterestK             int
+	InterestSimThreshold  float64
+	MMRLambda             float64
+	MMRCandidateCap       int
+	InterestCollinearMin  float64
+	SeenTTL               time.Duration
+	SeenHydrateLimit      int
+	ViewRetainLimit       int
+	ViewWriteWorkers      int
+	ViewWriteQueueSize    int
+	ShareMemoTTL          time.Duration
+	RecentCacheTTL        time.Duration
+	RecentCacheSize       int
 }
 
 func Load() Config {
+	viewRetain := envInt("VIEW_RETAIN_LIMIT", 1000)
+	hydrate := envInt("SEEN_HYDRATE_LIMIT", 50)
+	if hydrate > viewRetain {
+		hydrate = viewRetain
+	}
 	return Config{
 		Addr:                 envOr("ADDR", ":8090"),
 		DatabaseURL:          envOr("DATABASE_URL", "postgres://recsys:recsys@localhost:5432/recsys?sslmode=disable"),
@@ -39,10 +50,16 @@ func Load() Config {
 		InterestK:            envInt("INTEREST_K", 5),
 		InterestSimThreshold: envFloat("INTEREST_SIM_THRESHOLD", 0.55),
 		MMRLambda:            envFloat("MMR_LAMBDA", 0.7),
+		MMRCandidateCap:      envInt("MMR_CANDIDATE_CAP", 30),
+		InterestCollinearMin: envFloat("INTEREST_COLLINEAR_MIN", 0.9),
 		SeenTTL:              envDuration("SEEN_TTL", 3*24*time.Hour),
-		SeenHydrateLimit:     envInt("SEEN_HYDRATE_LIMIT", 50),
+		SeenHydrateLimit:     hydrate,
+		ViewRetainLimit:      viewRetain,
 		ViewWriteWorkers:     envInt("VIEW_WRITE_WORKERS", 8),
 		ViewWriteQueueSize:   envInt("VIEW_WRITE_QUEUE_SIZE", 4096),
+		ShareMemoTTL:         envDuration("SHARE_MEMO_TTL", 24*time.Hour),
+		RecentCacheTTL:       envDuration("RECENT_CACHE_TTL", 30*time.Second),
+		RecentCacheSize:      envInt("RECENT_CACHE_SIZE", 100),
 	}
 }
 
