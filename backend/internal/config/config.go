@@ -29,6 +29,8 @@ type Config struct {
 	ShareMemoTTL          time.Duration
 	RecentCacheTTL        time.Duration
 	RecentCacheSize       int
+	InteractionWriteWorkers   int
+	InteractionWriteQueueSize int
 }
 
 func Load() Config {
@@ -38,28 +40,30 @@ func Load() Config {
 		hydrate = viewRetain
 	}
 	return Config{
-		Addr:                 envOr("ADDR", ":8090"),
-		DatabaseURL:          envOr("DATABASE_URL", "postgres://recsys:recsys@localhost:5432/recsys?sslmode=disable"),
-		RedisAddr:            envOr("REDIS_ADDR", "localhost:6380"),
-		QdrantURL:            envOr("QDRANT_URL", "http://localhost:6334"),
-		EmbeddingURL:         envOr("EMBEDDING_URL", "http://localhost:8082"),
-		QdrantCollection:     envOr("QDRANT_COLLECTION", "posts"),
-		VectorDim:            envInt("VECTOR_DIM", 384),
-		FeedLimit:            envInt("FEED_LIMIT", 5),
-		QdrantOverfetch:      envInt("QDRANT_OVERFETCH", 50),
-		InterestK:            envInt("INTEREST_K", 5),
-		InterestSimThreshold: envFloat("INTEREST_SIM_THRESHOLD", 0.55),
-		MMRLambda:            envFloat("MMR_LAMBDA", 0.7),
-		MMRCandidateCap:      envInt("MMR_CANDIDATE_CAP", 30),
-		InterestCollinearMin: envFloat("INTEREST_COLLINEAR_MIN", 0.9),
-		SeenTTL:              envDuration("SEEN_TTL", 3*24*time.Hour),
-		SeenHydrateLimit:     hydrate,
-		ViewRetainLimit:      viewRetain,
-		ViewWriteWorkers:     envInt("VIEW_WRITE_WORKERS", 8),
-		ViewWriteQueueSize:   envInt("VIEW_WRITE_QUEUE_SIZE", 4096),
-		ShareMemoTTL:         envDuration("SHARE_MEMO_TTL", 24*time.Hour),
-		RecentCacheTTL:       envDuration("RECENT_CACHE_TTL", 30*time.Second),
-		RecentCacheSize:      envInt("RECENT_CACHE_SIZE", 100),
+		Addr:                      envOr("ADDR", ":8090"),
+		DatabaseURL:               envOr("DATABASE_URL", "postgres://recsys:recsys@localhost:5432/recsys?sslmode=disable"),
+		RedisAddr:                 envOr("REDIS_ADDR", "localhost:6380"),
+		QdrantURL:                 envOr("QDRANT_URL", "http://localhost:6334"),
+		EmbeddingURL:              envOr("EMBEDDING_URL", "http://localhost:8082"),
+		QdrantCollection:          envOr("QDRANT_COLLECTION", "posts"),
+		VectorDim:                 envInt("VECTOR_DIM", 384),
+		FeedLimit:                 envInt("FEED_LIMIT", 5),
+		QdrantOverfetch:           envInt("QDRANT_OVERFETCH", 50),
+		InterestK:                 envInt("INTEREST_K", 5),
+		InterestSimThreshold:      envFloat("INTEREST_SIM_THRESHOLD", 0.55),
+		MMRLambda:                 envFloat("MMR_LAMBDA", 0.7),
+		MMRCandidateCap:           envInt("MMR_CANDIDATE_CAP", 30),
+		InterestCollinearMin:      envFloat("INTEREST_COLLINEAR_MIN", 0.9),
+		SeenTTL:                   envDuration("SEEN_TTL", 3*24*time.Hour),
+		SeenHydrateLimit:          hydrate,
+		ViewRetainLimit:           viewRetain,
+		ViewWriteWorkers:          envInt("VIEW_WRITE_WORKERS", 8),
+		ViewWriteQueueSize:        envInt("VIEW_WRITE_QUEUE_SIZE", 4096),
+		ShareMemoTTL:              envDuration("SHARE_MEMO_TTL", 24*time.Hour),
+		RecentCacheTTL:            envDuration("RECENT_CACHE_TTL", 30*time.Second),
+		RecentCacheSize:           envInt("RECENT_CACHE_SIZE", 100),
+		InteractionWriteWorkers:   envInt("INTERACTION_WRITE_WORKERS", 8),
+		InteractionWriteQueueSize: envInt("INTERACTION_WRITE_QUEUE_SIZE", 4096),
 	}
 }
 
