@@ -23,6 +23,7 @@ func TestMarkViewedRetainLimitAndViewCount(t *testing.T) {
 
 	user, err := store.CreateUser(ctx, "retain_"+uuid.New().String()[:8])
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeleteUser(context.Background(), user.ID) })
 
 	const retain = 3
 	var posts []db.Post

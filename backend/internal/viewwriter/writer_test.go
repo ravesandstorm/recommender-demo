@@ -23,6 +23,7 @@ func TestViewWriterPersistsAsync(t *testing.T) {
 
 	user, err := store.CreateUser(ctx, "vw_"+uuid.New().String()[:8])
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeleteUser(context.Background(), user.ID) })
 	post, err := store.InsertPost(ctx, "VW", "viewwriter "+uuid.New().String())
 	require.NoError(t, err)
 

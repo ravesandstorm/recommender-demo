@@ -28,6 +28,10 @@ func TestSeenFilterMarkAndHydrate(t *testing.T) {
 	user, err := store.CreateUser(ctx, "seen_"+uuid.New().String()[:8])
 	require.NoError(t, err)
 	userID := user.ID.String()
+	t.Cleanup(func() {
+		_ = store.DeleteUser(context.Background(), user.ID)
+		_, _ = rdb.DeleteUserKeys(context.Background(), userID)
+	})
 	ttl := time.Hour
 
 	a := uuid.New().String()
