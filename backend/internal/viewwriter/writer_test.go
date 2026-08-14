@@ -19,13 +19,14 @@ func TestViewWriterPersistsAsync(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable: %v", err)
 	}
-	defer store.Pool.Close()
+	t.Cleanup(func() { store.Pool.Close() })
 
 	user, err := store.CreateUser(ctx, "vw_"+uuid.New().String()[:8])
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = store.DeleteUser(context.Background(), user.ID) })
 	post, err := store.InsertPost(ctx, "VW", "viewwriter "+uuid.New().String())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeletePost(context.Background(), post.ID) })
 
 	w := viewwriter.New(store, 2, 16, cfg.ViewRetainLimit)
 	w.Enqueue(user.ID, []uuid.UUID{post.ID})
@@ -43,7 +44,7 @@ func TestViewWriterDropsWhenFull(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable: %v", err)
 	}
-	defer store.Pool.Close()
+	t.Cleanup(func() { store.Pool.Close() })
 
 	// Queue size 1, no workers draining until we don't start... New always starts workers.
 	// Fill queue faster than workers can write by enqueueing many tiny jobs; drop path must not panic.

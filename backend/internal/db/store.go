@@ -111,6 +111,21 @@ func (s *Store) InsertPost(ctx context.Context, title, content string) (Post, er
 	return p, err
 }
 
+// DeletePost removes a post; FK CASCADE clears likes/saves/comments/shares/post_views.
+func (s *Store) DeletePost(ctx context.Context, id uuid.UUID) error {
+	_, err := s.Pool.Exec(ctx, `DELETE FROM posts WHERE id=$1`, id)
+	return err
+}
+
+// DeletePosts removes multiple posts in one statement.
+func (s *Store) DeletePosts(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, `DELETE FROM posts WHERE id = ANY($1)`, ids)
+	return err
+}
+
 func (s *Store) GetPostsByIDs(ctx context.Context, ids []uuid.UUID) ([]Post, error) {
 	if len(ids) == 0 {
 		return nil, nil

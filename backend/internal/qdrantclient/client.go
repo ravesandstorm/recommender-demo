@@ -102,6 +102,32 @@ func (c *Client) Upsert(ctx context.Context, points []UpsertPoint) error {
 	return nil
 }
 
+// DeletePoints removes points by UUID string ids (best-effort for test cleanup).
+func (c *Client) DeletePoints(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	payload := map[string]any{
+		"points": ids,
+	}
+	raw, _ := json.Marshal(payload)
+	url := fmt.Sprintf("%s/collections/%s/points/delete?wait=true", c.baseURL, c.collection)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("delete points status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *Client) GetVector(ctx context.Context, postID string) ([]float32, error) {
 	url := fmt.Sprintf("%s/collections/%s/points/%s", c.baseURL, c.collection, postID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
