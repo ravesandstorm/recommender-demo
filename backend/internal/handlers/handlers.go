@@ -11,6 +11,7 @@ import (
 	"github.com/recsys/backend/internal/config"
 	"github.com/recsys/backend/internal/db"
 	"github.com/recsys/backend/internal/embedclient"
+	"github.com/recsys/backend/internal/interactionwriter"
 	"github.com/recsys/backend/internal/qdrantclient"
 	"github.com/recsys/backend/internal/redisstore"
 	"github.com/recsys/backend/internal/vector"
@@ -19,12 +20,13 @@ import (
 )
 
 type API struct {
-	Cfg    config.Config
-	DB     *db.Store
-	Redis  *redisstore.Store
-	Qdrant *qdrantclient.Client
-	Embed  *embedclient.Client
-	Views  *viewwriter.Writer
+	Cfg          config.Config
+	DB           *db.Store
+	Redis        *redisstore.Store
+	Qdrant       *qdrantclient.Client
+	Embed        *embedclient.Client
+	Views        *viewwriter.Writer
+	Interactions *interactionwriter.Writer
 }
 
 func (a *API) Routes() http.Handler {
@@ -33,6 +35,8 @@ func (a *API) Routes() http.Handler {
 	r.Get("/api/config", a.GetConfig)
 	r.Get("/api/users", a.ListUsers)
 	r.Post("/api/users", a.CreateUser)
+	r.Delete("/api/users/{userID}", a.DeleteUser)
+	r.Get("/api/me/interactions", a.ListMyInteractions)
 
 	r.Route("/api/posts/{postID}", func(r chi.Router) {
 		r.Post("/like", a.Like)
@@ -115,6 +119,8 @@ func (a *API) GetConfig(w http.ResponseWriter, r *http.Request) {
 		"share_memo_ttl_seconds": int(a.Cfg.ShareMemoTTL.Seconds()),
 		"recent_cache_ttl_seconds": int(a.Cfg.RecentCacheTTL.Seconds()),
 		"recent_cache_size":      a.Cfg.RecentCacheSize,
+		"interaction_write_workers":    a.Cfg.InteractionWriteWorkers,
+		"interaction_write_queue_size": a.Cfg.InteractionWriteQueueSize,
 		"feed_slots": map[string]int{
 			"exploit":      exploit,
 			"soft_explore": soft,
@@ -154,6 +160,23 @@ func (a *API) CreateUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, u)
 }
 
+func (a *API) DeleteUser(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	ctx := r.Context()
+	if err := a.DB.DeleteUser(ctx, id); err != nil {
+		writeErr(w, http.StatusNotFound, "user not found")
+		return
+	}
+	_, _ = a.Redis.DeleteUserKeys(ctx, id.String())
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// applyVector updates Redis interests/vector from an interaction.
+// Views do not call this — impressions are not preference signals.
 func (a *API) applyVector(ctx context.Context, userID, postID uuid.UUID, interactionType string, subtract bool) error {
 	weight, err := a.DB.GetWeight(ctx, interactionType)
 	if err != nil {
@@ -188,14 +211,15 @@ func (a *API) setLike(w http.ResponseWriter, r *http.Request, wantLike bool) {
 		return
 	}
 	ctx := r.Context()
+	uid := userID.String()
+	pid := postID.String()
 
-	prevLike, exists, err := a.DB.GetLike(ctx, userID, postID)
+	prevLike, exists, err := a.likeState(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Undo previous signal if switching or re-applying same after already set
 	if exists {
 		prevType := "dislike"
 		if prevLike {
@@ -215,7 +239,7 @@ func (a *API) setLike(w http.ResponseWriter, r *http.Request, wantLike bool) {
 	if wantLike {
 		newType = "like"
 	}
-	if err := a.DB.UpsertLike(ctx, userID, postID, wantLike); err != nil {
+	if err := a.Redis.SetEngLike(ctx, uid, pid, wantLike); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -223,6 +247,9 @@ func (a *API) setLike(w http.ResponseWriter, r *http.Request, wantLike bool) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindUpsertLike, UserID: userID, PostID: postID, IsLike: wantLike,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "is_like": wantLike})
 }
 
@@ -236,7 +263,10 @@ func (a *API) clearLike(w http.ResponseWriter, r *http.Request, expectLike bool)
 		return
 	}
 	ctx := r.Context()
-	prevLike, exists, err := a.DB.GetLike(ctx, userID, postID)
+	uid := userID.String()
+	pid := postID.String()
+
+	prevLike, exists, err := a.likeState(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -253,10 +283,13 @@ func (a *API) clearLike(w http.ResponseWriter, r *http.Request, expectLike bool)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := a.DB.DeleteLike(ctx, userID, postID); err != nil {
+	if err := a.Redis.ClearEngLike(ctx, uid, pid); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindDeleteLike, UserID: userID, PostID: postID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
@@ -277,7 +310,10 @@ func (a *API) Save(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	exists, err := a.DB.HasSave(ctx, userID, postID)
+	uid := userID.String()
+	pid := postID.String()
+
+	exists, err := a.saveState(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -286,7 +322,7 @@ func (a *API) Save(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
 		return
 	}
-	if err := a.DB.InsertSave(ctx, userID, postID); err != nil {
+	if err := a.Redis.SetEngSave(ctx, uid, pid); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -294,6 +330,9 @@ func (a *API) Save(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindInsertSave, UserID: userID, PostID: postID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -307,7 +346,10 @@ func (a *API) Unsave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	exists, err := a.DB.HasSave(ctx, userID, postID)
+	uid := userID.String()
+	pid := postID.String()
+
+	exists, err := a.saveState(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -320,10 +362,13 @@ func (a *API) Unsave(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := a.DB.DeleteSave(ctx, userID, postID); err != nil {
+	if err := a.Redis.ClearEngSave(ctx, uid, pid); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindDeleteSave, UserID: userID, PostID: postID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
@@ -345,33 +390,46 @@ func (a *API) Share(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !memoHit {
+		engHit, err := a.Redis.HasEngShare(ctx, uid, pid)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		memoHit = engHit
+	}
+	if !memoHit {
+		pgHit, err := a.DB.HasShare(ctx, userID, postID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if pgHit {
+			_ = a.Redis.SetEngShare(ctx, uid, pid)
+			_ = a.Redis.SetShareMemo(ctx, uid, pid, a.Cfg.ShareMemoTTL)
+			writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
+			return
+		}
+	}
 	if memoHit {
+		_ = a.Redis.SetShareMemo(ctx, uid, pid, a.Cfg.ShareMemoTTL)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
 		return
 	}
 
-	inserted, err := a.DB.InsertShare(ctx, userID, postID)
-	if err != nil {
+	if err := a.Redis.SetEngShare(ctx, uid, pid); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Memo whether newly inserted or already in PG (conflict).
 	_ = a.Redis.SetShareMemo(ctx, uid, pid, a.Cfg.ShareMemoTTL)
-	if !inserted {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
-		return
-	}
-
-	count, err := a.DB.IncrementShare(ctx, postID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	if err := a.applyVector(ctx, userID, postID, "share", false); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "share_count": count})
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindInsertShare, UserID: userID, PostID: postID,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 func (a *API) ListComments(w http.ResponseWriter, r *http.Request) {
