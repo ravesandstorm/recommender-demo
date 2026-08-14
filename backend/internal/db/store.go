@@ -81,6 +81,27 @@ func (s *Store) UserExists(ctx context.Context, id uuid.UUID) (bool, error) {
 	return ok, err
 }
 
+// DeleteUser removes the user row; FK CASCADE clears likes/saves/comments/shares/post_views.
+func (s *Store) DeleteUser(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM users WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// UserInteractionItem is a user-scoped engagement row with post title for the UI.
+type UserInteractionItem struct {
+	ID        uuid.UUID `json:"id,omitempty"`
+	PostID    uuid.UUID `json:"post_id"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 func (s *Store) InsertPost(ctx context.Context, title, content string) (Post, error) {
 	var p Post
 	err := s.Pool.QueryRow(ctx, `
@@ -403,6 +424,12 @@ func (s *Store) InsertShare(ctx context.Context, userID, postID uuid.UUID) (bool
 	return tag.RowsAffected() > 0, nil
 }
 
+func (s *Store) HasShare(ctx context.Context, userID, postID uuid.UUID) (bool, error) {
+	var ok bool
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM shares WHERE user_id=$1 AND post_id=$2)`, userID, postID).Scan(&ok)
+	return ok, err
+}
+
 func (s *Store) IncrementShare(ctx context.Context, postID uuid.UUID) (int, error) {
 	var count int
 	err := s.Pool.QueryRow(ctx, `
@@ -426,6 +453,130 @@ func (s *Store) ListWeights(ctx context.Context) (map[string]float64, error) {
 			return nil, err
 		}
 		out[t] = w
+	}
+	return out, rows.Err()
+}
+
+// ListUserLikes returns likes (is_like=true) for the user, newest first.
+func (s *Store) ListUserLikes(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	return s.listUserLikeKind(ctx, userID, true)
+}
+
+// ListUserDislikes returns dislikes (is_like=false) for the user, newest first.
+func (s *Store) ListUserDislikes(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	return s.listUserLikeKind(ctx, userID, false)
+}
+
+func (s *Store) listUserLikeKind(ctx context.Context, userID uuid.UUID, isLike bool) ([]UserInteractionItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT l.post_id, p.title, l.created_at
+		FROM likes l
+		JOIN posts p ON p.id = l.post_id
+		WHERE l.user_id=$1 AND l.is_like=$2
+		ORDER BY l.created_at DESC
+	`, userID, isLike)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserInteractionItem
+	for rows.Next() {
+		var it UserInteractionItem
+		if err := rows.Scan(&it.PostID, &it.Title, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListUserSaves(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT s.post_id, p.title, s.created_at
+		FROM saves s
+		JOIN posts p ON p.id = s.post_id
+		WHERE s.user_id=$1
+		ORDER BY s.created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserInteractionItem
+	for rows.Next() {
+		var it UserInteractionItem
+		if err := rows.Scan(&it.PostID, &it.Title, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListUserShares(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT sh.post_id, p.title, sh.created_at
+		FROM shares sh
+		JOIN posts p ON p.id = sh.post_id
+		WHERE sh.user_id=$1
+		ORDER BY sh.created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserInteractionItem
+	for rows.Next() {
+		var it UserInteractionItem
+		if err := rows.Scan(&it.PostID, &it.Title, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListUserComments(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT c.id, c.post_id, p.title, c.body, c.created_at
+		FROM comments c
+		JOIN posts p ON p.id = c.post_id
+		WHERE c.user_id=$1
+		ORDER BY c.created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserInteractionItem
+	for rows.Next() {
+		var it UserInteractionItem
+		if err := rows.Scan(&it.ID, &it.PostID, &it.Title, &it.Body, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// GetPostTitles returns id → title for the given post IDs.
+func (s *Store) GetPostTitles(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := map[uuid.UUID]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.Pool.Query(ctx, `SELECT id, title FROM posts WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var title string
+		if err := rows.Scan(&id, &title); err != nil {
+			return nil, err
+		}
+		out[id] = title
 	}
 	return out, rows.Err()
 }
