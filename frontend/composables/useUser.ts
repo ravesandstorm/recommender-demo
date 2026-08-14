@@ -17,12 +17,16 @@ export function useUser() {
     }
   }
 
+  function clearUser() {
+    userId.value = ''
+    if (import.meta.client) localStorage.removeItem('recsys_user_id')
+  }
+
   async function refreshUsers() {
     const api = useApi()
     users.value = await api.listUsers()
     if (userId.value && users.value.length > 0 && !users.value.some(u => u.id === userId.value)) {
-      userId.value = ''
-      if (import.meta.client) localStorage.removeItem('recsys_user_id')
+      clearUser()
     }
   }
 
@@ -34,5 +38,14 @@ export function useUser() {
     return u
   }
 
-  return { userId, users, loadFromStorage, selectUser, refreshUsers, createUser }
+  async function deleteUser(id: string) {
+    const api = useApi()
+    await api.deleteUser(id)
+    users.value = users.value.filter(u => u.id !== id)
+    if (userId.value === id) {
+      clearUser()
+    }
+  }
+
+  return { userId, users, loadFromStorage, selectUser, clearUser, refreshUsers, createUser, deleteUser }
 }

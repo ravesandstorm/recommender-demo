@@ -19,6 +19,22 @@ export type Comment = {
   username?: string
 }
 
+export type InteractionItem = {
+  id?: string
+  post_id: string
+  title: string
+  body?: string
+  created_at: string
+}
+
+export type MyInteractions = {
+  likes: InteractionItem[]
+  dislikes: InteractionItem[]
+  saves: InteractionItem[]
+  shares: InteractionItem[]
+  comments: InteractionItem[]
+}
+
 export function useApi() {
   const config = useRuntimeConfig()
   const base = config.public.apiBase as string
@@ -48,6 +64,9 @@ export function useApi() {
     listUsers: () => api<User[]>('/api/users'),
     createUser: (username: string) =>
       api<User>('/api/users', { method: 'POST', body: JSON.stringify({ username }) }),
+    deleteUser: (id: string) =>
+      api<{ status: string }>(`/api/users/${id}`, { method: 'DELETE' }),
+    listMyInteractions: () => api<MyInteractions>('/api/me/interactions'),
     fetchFeed: () => api<{ posts: Post[] }>('/api/feed'),
     like: (postId: string) => api(`/api/posts/${postId}/like`, { method: 'POST' }),
     unlike: (postId: string) => api(`/api/posts/${postId}/like`, { method: 'DELETE' }),
