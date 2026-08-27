@@ -1,4 +1,4 @@
-.PHONY: up down api seed frontend test flush flush-prefs
+.PHONY: up down api seed frontend test test-unit test-edge test-integration test-go flush flush-prefs
 
 help:
 	@echo "Targets:"
@@ -32,5 +32,17 @@ flush-prefs: ## Wipe user preference vectors, interests, and seen sets
 			done; \
 		done; echo wiped'
 
-test: ## Run backend tests (requires compose services healthy)
+test: ## Run custom test suite with metrics, edge cases & summary view
+	cd backend && go run ./cmd/testrunner -scope=all
+
+test-unit: ## Run unit tests with metrics
+	cd backend && go run ./cmd/testrunner -scope=unit
+
+test-edge: ## Run edge case tests with metrics
+	cd backend && go run ./cmd/testrunner -scope=edge-case
+
+test-integration: ## Run end-to-end integration tests with metrics
+	cd backend && go run ./cmd/testrunner -scope=integration
+
+test-go: ## Run standard native Go tests
 	cd backend && go test ./... -count=1 -timeout 180s
