@@ -13,7 +13,7 @@ import (
 
 func main() {
 	var (
-		scopeFilter = flag.String("scope", "all", "Filter by scope: all, unit, integration, edge, vector, redis, db, handlers, workers, api")
+		scopeFilter = flag.String("scope", "all", "Filter by scope: all, unit, integration, edge, stress, stress-light, stress-heavy, vector, redis, db, handlers, workers, api")
 		pattern     = flag.String("filter", "", "Filter tests by name or description substring")
 		verbose     = flag.Bool("v", false, "Enable verbose per-test execution trace logs")
 		jsonOutput  = flag.Bool("json", false, "Output results in JSON format")
@@ -42,6 +42,7 @@ func main() {
 	runner.RegisterBatch(testsuite.APISuite(runner))
 	runner.RegisterBatch(testsuite.EdgeCasesSuite(runner))
 	runner.RegisterBatch(testsuite.IntegrationSuite(runner))
+	runner.RegisterBatch(testsuite.StressSuite(runner))
 
 	summary, err := runner.Run(ctx, *scopeFilter, *pattern)
 	if err != nil {

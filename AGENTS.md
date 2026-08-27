@@ -22,11 +22,14 @@ Auth is demo-style: clients send `X-User-ID` (UUID). No real sessions.
 ## Quick start
 
 ```bash
-make up          # docker: postgres, redis, qdrant, embedding
-make api         # Go API on :8090 (runs migrations, ensures Qdrant collection)
-make seed        # JSON → Postgres + embed + Qdrant
-make frontend    # Nuxt on :3000 (pnpm)
-make test        # backend go test ./... (needs compose healthy)
+make up                 # docker: postgres, redis, qdrant, embedding
+make api                # Go API on :8090 (runs migrations, ensures Qdrant collection)
+make seed               # JSON → Postgres + embed + Qdrant
+make frontend           # Nuxt on :3000 (pnpm)
+make test               # Custom metrics test suite (unit + integration + edge + light stress)
+make test-stress-light  # Light load simulation (10 concurrent users fetching 1 feed + interacting)
+make test-heavy         # Isolated heavy saturation stress test (200 concurrent users fetching 1 feed)
+make test-go            # backend go test ./... (needs compose healthy)
 ```
 
 Ports (host mappings from `docker-compose.yml` / `.env.example`):
