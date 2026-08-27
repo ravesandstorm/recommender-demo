@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -241,18 +242,36 @@ func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid
 		retainLimit = 1
 	}
 
+	// Deterministically sort post IDs so concurrent index lock acquisition order is identical
+	sortedIDs := make([]uuid.UUID, len(postIDs))
+	copy(sortedIDs, postIDs)
+	sort.Slice(sortedIDs, func(i, j int) bool {
+		return sortedIDs[i].String() < sortedIDs[j].String()
+	})
+
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
+	// Acquire row locks on posts in sorted order first to prevent foreign-key shared lock vs UPDATE deadlocks
+	_, err = tx.Exec(ctx, `
+		SELECT id FROM posts
+		WHERE id = ANY($1)
+		ORDER BY id
+		FOR UPDATE
+	`, sortedIDs)
+	if err != nil {
+		return err
+	}
+
 	rows, err := tx.Query(ctx, `
 		INSERT INTO post_views (user_id, post_id)
 		SELECT $1, x FROM unnest($2::uuid[]) AS x
 		ON CONFLICT DO NOTHING
 		RETURNING post_id
-	`, userID, postIDs)
+	`, userID, sortedIDs)
 	if err != nil {
 		return err
 	}
@@ -271,6 +290,10 @@ func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid
 	}
 
 	if len(inserted) > 0 {
+		// Sort inserted IDs to acquire row locks in deterministic order and prevent Postgres deadlocks
+		sort.Slice(inserted, func(i, j int) bool {
+			return inserted[i].String() < inserted[j].String()
+		})
 		_, err = tx.Exec(ctx, `
 			UPDATE posts SET view_count = view_count + 1
 			WHERE id = ANY($1)
