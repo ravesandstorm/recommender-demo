@@ -81,6 +81,27 @@ func (s *Store) UserExists(ctx context.Context, id uuid.UUID) (bool, error) {
 	return ok, err
 }
 
+// DeleteUser removes the user row; FK CASCADE clears likes/saves/comments/shares/post_views.
+func (s *Store) DeleteUser(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.Pool.Exec(ctx, `DELETE FROM users WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// UserInteractionItem is a user-scoped engagement row with post title for the UI.
+type UserInteractionItem struct {
+	ID        uuid.UUID `json:"id,omitempty"`
+	PostID    uuid.UUID `json:"post_id"`
+	Title     string    `json:"title"`
+	Body      string    `json:"body,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 func (s *Store) InsertPost(ctx context.Context, title, content string) (Post, error) {
 	var p Post
 	err := s.Pool.QueryRow(ctx, `
@@ -195,16 +216,117 @@ func (s *Store) FilterUnviewed(ctx context.Context, userID uuid.UUID, candidateI
 	return out, rows.Err()
 }
 
-func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid.UUID) error {
+// MarkViewed inserts new view rows, increments posts.view_count for those inserts,
+// then trims the user's post_views to at most retainLimit newest rows.
+func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid.UUID, retainLimit int) error {
 	if len(postIDs) == 0 {
 		return nil
 	}
-	_, err := s.Pool.Exec(ctx, `
+	if retainLimit < 1 {
+		retainLimit = 1
+	}
+
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
 		INSERT INTO post_views (user_id, post_id)
 		SELECT $1, x FROM unnest($2::uuid[]) AS x
 		ON CONFLICT DO NOTHING
+		RETURNING post_id
 	`, userID, postIDs)
-	return err
+	if err != nil {
+		return err
+	}
+	var inserted []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		inserted = append(inserted, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(inserted) > 0 {
+		_, err = tx.Exec(ctx, `
+			UPDATE posts SET view_count = view_count + 1
+			WHERE id = ANY($1)
+		`, inserted)
+		if err != nil {
+			return err
+		}
+	}
+
+	var total int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM post_views WHERE user_id=$1
+	`, userID).Scan(&total); err != nil {
+		return err
+	}
+	if excess := total - retainLimit; excess > 0 {
+		_, err = tx.Exec(ctx, `
+			DELETE FROM post_views
+			WHERE ctid IN (
+				SELECT ctid FROM post_views
+				WHERE user_id=$1
+				ORDER BY viewed_at ASC
+				LIMIT $2
+			)
+		`, userID, excess)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit(ctx)
+}
+
+// CountUserViews returns how many post_views rows exist for the user.
+func (s *Store) CountUserViews(ctx context.Context, userID uuid.UUID) (int, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM post_views WHERE user_id=$1`, userID).Scan(&n)
+	return n, err
+}
+
+// GetPostViewCount returns posts.view_count for a post.
+func (s *Store) GetPostViewCount(ctx context.Context, postID uuid.UUID) (int, error) {
+	var n int
+	err := s.Pool.QueryRow(ctx, `SELECT view_count FROM posts WHERE id=$1`, postID).Scan(&n)
+	return n, err
+}
+
+func (s *Store) ListRecentViewedPostIDs(ctx context.Context, userID uuid.UUID, limit int) ([]uuid.UUID, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.Pool.Query(ctx, `
+		SELECT post_id
+		FROM post_views
+		WHERE user_id=$1
+		ORDER BY viewed_at DESC
+		LIMIT $2
+	`, userID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) GetWeight(ctx context.Context, interactionType string) (float64, error) {
@@ -291,6 +413,23 @@ func (s *Store) ListComments(ctx context.Context, postID uuid.UUID) ([]Comment, 
 	return out, rows.Err()
 }
 
+func (s *Store) InsertShare(ctx context.Context, userID, postID uuid.UUID) (bool, error) {
+	tag, err := s.Pool.Exec(ctx, `
+		INSERT INTO shares (user_id, post_id) VALUES ($1,$2)
+		ON CONFLICT DO NOTHING
+	`, userID, postID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *Store) HasShare(ctx context.Context, userID, postID uuid.UUID) (bool, error) {
+	var ok bool
+	err := s.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM shares WHERE user_id=$1 AND post_id=$2)`, userID, postID).Scan(&ok)
+	return ok, err
+}
+
 func (s *Store) IncrementShare(ctx context.Context, postID uuid.UUID) (int, error) {
 	var count int
 	err := s.Pool.QueryRow(ctx, `
@@ -314,6 +453,130 @@ func (s *Store) ListWeights(ctx context.Context) (map[string]float64, error) {
 			return nil, err
 		}
 		out[t] = w
+	}
+	return out, rows.Err()
+}
+
+// ListUserLikes returns likes (is_like=true) for the user, newest first.
+func (s *Store) ListUserLikes(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	return s.listUserLikeKind(ctx, userID, true)
+}
+
+// ListUserDislikes returns dislikes (is_like=false) for the user, newest first.
+func (s *Store) ListUserDislikes(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	return s.listUserLikeKind(ctx, userID, false)
+}
+
+func (s *Store) listUserLikeKind(ctx context.Context, userID uuid.UUID, isLike bool) ([]UserInteractionItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT l.post_id, p.title, l.created_at
+		FROM likes l
+		JOIN posts p ON p.id = l.post_id
+		WHERE l.user_id=$1 AND l.is_like=$2
+		ORDER BY l.created_at DESC
+	`, userID, isLike)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserInteractionItem
+	for rows.Next() {
+		var it UserInteractionItem
+		if err := rows.Scan(&it.PostID, &it.Title, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListUserSaves(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT s.post_id, p.title, s.created_at
+		FROM saves s
+		JOIN posts p ON p.id = s.post_id
+		WHERE s.user_id=$1
+		ORDER BY s.created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserInteractionItem
+	for rows.Next() {
+		var it UserInteractionItem
+		if err := rows.Scan(&it.PostID, &it.Title, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListUserShares(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT sh.post_id, p.title, sh.created_at
+		FROM shares sh
+		JOIN posts p ON p.id = sh.post_id
+		WHERE sh.user_id=$1
+		ORDER BY sh.created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserInteractionItem
+	for rows.Next() {
+		var it UserInteractionItem
+		if err := rows.Scan(&it.PostID, &it.Title, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListUserComments(ctx context.Context, userID uuid.UUID) ([]UserInteractionItem, error) {
+	rows, err := s.Pool.Query(ctx, `
+		SELECT c.id, c.post_id, p.title, c.body, c.created_at
+		FROM comments c
+		JOIN posts p ON p.id = c.post_id
+		WHERE c.user_id=$1
+		ORDER BY c.created_at DESC
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UserInteractionItem
+	for rows.Next() {
+		var it UserInteractionItem
+		if err := rows.Scan(&it.ID, &it.PostID, &it.Title, &it.Body, &it.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// GetPostTitles returns id → title for the given post IDs.
+func (s *Store) GetPostTitles(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]string, error) {
+	out := map[uuid.UUID]string{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.Pool.Query(ctx, `SELECT id, title FROM posts WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		var title string
+		if err := rows.Scan(&id, &title); err != nil {
+			return nil, err
+		}
+		out[id] = title
 	}
 	return out, rows.Err()
 }

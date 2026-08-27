@@ -19,6 +19,8 @@ import (
 	"github.com/recsys/backend/internal/migrate"
 	"github.com/recsys/backend/internal/qdrantclient"
 	"github.com/recsys/backend/internal/redisstore"
+	"github.com/recsys/backend/internal/interactionwriter"
+	"github.com/recsys/backend/internal/viewwriter"
 )
 
 func main() {
@@ -47,13 +49,17 @@ func main() {
 	}
 
 	embed := embedclient.New(cfg.EmbeddingURL)
+	views := viewwriter.New(store, cfg.ViewWriteWorkers, cfg.ViewWriteQueueSize, cfg.ViewRetainLimit)
+	ix := interactionwriter.New(store, cfg.InteractionWriteWorkers, cfg.InteractionWriteQueueSize)
 
 	api := &handlers.API{
-		Cfg:    cfg,
-		DB:     store,
-		Redis:  rdb,
-		Qdrant: qdrant,
-		Embed:  embed,
+		Cfg:          cfg,
+		DB:           store,
+		Redis:        rdb,
+		Qdrant:       qdrant,
+		Embed:        embed,
+		Views:        views,
+		Interactions: ix,
 	}
 
 	r := chi.NewRouter()
@@ -83,4 +89,6 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
+	views.Close()
+	ix.Close()
 }

@@ -4,23 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/recsys/backend/internal/config"
 	"github.com/recsys/backend/internal/db"
 	"github.com/recsys/backend/internal/embedclient"
+	"github.com/recsys/backend/internal/interactionwriter"
 	"github.com/recsys/backend/internal/qdrantclient"
 	"github.com/recsys/backend/internal/redisstore"
 	"github.com/recsys/backend/internal/vector"
+	"github.com/recsys/backend/internal/viewwriter"
+	"golang.org/x/sync/errgroup"
 )
 
 type API struct {
-	Cfg    config.Config
-	DB     *db.Store
-	Redis  *redisstore.Store
-	Qdrant *qdrantclient.Client
-	Embed  *embedclient.Client
+	Cfg          config.Config
+	DB           *db.Store
+	Redis        *redisstore.Store
+	Qdrant       *qdrantclient.Client
+	Embed        *embedclient.Client
+	Views        *viewwriter.Writer
+	Interactions *interactionwriter.Writer
 }
 
 func (a *API) Routes() http.Handler {
@@ -29,6 +35,8 @@ func (a *API) Routes() http.Handler {
 	r.Get("/api/config", a.GetConfig)
 	r.Get("/api/users", a.ListUsers)
 	r.Post("/api/users", a.CreateUser)
+	r.Delete("/api/users/{userID}", a.DeleteUser)
+	r.Get("/api/me/interactions", a.ListMyInteractions)
 
 	r.Route("/api/posts/{postID}", func(r chi.Router) {
 		r.Post("/like", a.Like)
@@ -94,11 +102,30 @@ func (a *API) GetConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	exploit, soft, hard := feedSlots(a.Cfg.FeedLimit)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"feed_limit":          a.Cfg.FeedLimit,
-		"qdrant_overfetch":    a.Cfg.QdrantOverfetch,
-		"vector_dim":          a.Cfg.VectorDim,
-		"interaction_weights": weights,
+		"feed_limit":             a.Cfg.FeedLimit,
+		"qdrant_overfetch":       a.Cfg.QdrantOverfetch,
+		"vector_dim":             a.Cfg.VectorDim,
+		"interaction_weights":    weights,
+		"interest_k":             a.Cfg.InterestK,
+		"interest_sim_threshold": a.Cfg.InterestSimThreshold,
+		"mmr_lambda":             a.Cfg.MMRLambda,
+		"mmr_candidate_cap":      a.Cfg.MMRCandidateCap,
+		"interest_collinear_min": a.Cfg.InterestCollinearMin,
+		"seen_ttl_seconds":       int(a.Cfg.SeenTTL.Seconds()),
+		"seen_hydrate_limit":     a.Cfg.SeenHydrateLimit,
+		"view_retain_limit":      a.Cfg.ViewRetainLimit,
+		"share_memo_ttl_seconds": int(a.Cfg.ShareMemoTTL.Seconds()),
+		"recent_cache_ttl_seconds": int(a.Cfg.RecentCacheTTL.Seconds()),
+		"recent_cache_size":      a.Cfg.RecentCacheSize,
+		"interaction_write_workers":    a.Cfg.InteractionWriteWorkers,
+		"interaction_write_queue_size": a.Cfg.InteractionWriteQueueSize,
+		"feed_slots": map[string]int{
+			"exploit":      exploit,
+			"soft_explore": soft,
+			"hard_explore": hard,
+		},
 	})
 }
 
@@ -127,34 +154,51 @@ func (a *API) CreateUser(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusConflict, "could not create user (username may be taken)")
 		return
 	}
-	// init zero vector
+	// init empty multi-interest profile (+ blended zero vector for legacy readers)
+	_ = a.Redis.SetUserInterests(r.Context(), u.ID.String(), nil)
 	_ = a.Redis.SetUserVector(r.Context(), u.ID.String(), vector.Zero(a.Cfg.VectorDim))
 	writeJSON(w, http.StatusCreated, u)
 }
 
+func (a *API) DeleteUser(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	ctx := r.Context()
+	if err := a.DB.DeleteUser(ctx, id); err != nil {
+		writeErr(w, http.StatusNotFound, "user not found")
+		return
+	}
+	_, _ = a.Redis.DeleteUserKeys(ctx, id.String())
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// applyVector updates Redis interests/vector from an interaction.
+// Views do not call this — impressions are not preference signals.
 func (a *API) applyVector(ctx context.Context, userID, postID uuid.UUID, interactionType string, subtract bool) error {
 	weight, err := a.DB.GetWeight(ctx, interactionType)
 	if err != nil {
 		return err
 	}
+	if subtract {
+		weight = -weight
+	}
 	postVec, err := a.Qdrant.GetVector(ctx, postID.String())
 	if err != nil {
 		return err
 	}
-	userVec, err := a.Redis.GetUserVector(ctx, userID.String())
+	interests, err := a.Redis.GetUserInterests(ctx, userID.String())
 	if err != nil {
 		return err
 	}
-	if len(userVec) != a.Cfg.VectorDim {
-		userVec = vector.Zero(a.Cfg.VectorDim)
+	next := vector.ApplyInterest(interests, postVec, weight, a.Cfg.InterestK, a.Cfg.InterestSimThreshold)
+	if err := a.Redis.SetUserInterests(ctx, userID.String(), next); err != nil {
+		return err
 	}
-	var next []float32
-	if subtract {
-		next = vector.SubScaled(userVec, weight, postVec)
-	} else {
-		next = vector.AddScaled(userVec, weight, postVec)
-	}
-	return a.Redis.SetUserVector(ctx, userID.String(), next)
+	// Keep blended single vector in sync for debugging / legacy cold-start checks.
+	return a.Redis.SetUserVector(ctx, userID.String(), vector.BlendInterests(next, a.Cfg.VectorDim))
 }
 
 func (a *API) setLike(w http.ResponseWriter, r *http.Request, wantLike bool) {
@@ -167,14 +211,15 @@ func (a *API) setLike(w http.ResponseWriter, r *http.Request, wantLike bool) {
 		return
 	}
 	ctx := r.Context()
+	uid := userID.String()
+	pid := postID.String()
 
-	prevLike, exists, err := a.DB.GetLike(ctx, userID, postID)
+	prevLike, exists, err := a.likeState(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Undo previous signal if switching or re-applying same after already set
 	if exists {
 		prevType := "dislike"
 		if prevLike {
@@ -194,7 +239,7 @@ func (a *API) setLike(w http.ResponseWriter, r *http.Request, wantLike bool) {
 	if wantLike {
 		newType = "like"
 	}
-	if err := a.DB.UpsertLike(ctx, userID, postID, wantLike); err != nil {
+	if err := a.Redis.SetEngLike(ctx, uid, pid, wantLike); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -202,6 +247,9 @@ func (a *API) setLike(w http.ResponseWriter, r *http.Request, wantLike bool) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindUpsertLike, UserID: userID, PostID: postID, IsLike: wantLike,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "is_like": wantLike})
 }
 
@@ -215,7 +263,10 @@ func (a *API) clearLike(w http.ResponseWriter, r *http.Request, expectLike bool)
 		return
 	}
 	ctx := r.Context()
-	prevLike, exists, err := a.DB.GetLike(ctx, userID, postID)
+	uid := userID.String()
+	pid := postID.String()
+
+	prevLike, exists, err := a.likeState(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -232,10 +283,13 @@ func (a *API) clearLike(w http.ResponseWriter, r *http.Request, expectLike bool)
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := a.DB.DeleteLike(ctx, userID, postID); err != nil {
+	if err := a.Redis.ClearEngLike(ctx, uid, pid); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindDeleteLike, UserID: userID, PostID: postID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
@@ -256,7 +310,10 @@ func (a *API) Save(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	exists, err := a.DB.HasSave(ctx, userID, postID)
+	uid := userID.String()
+	pid := postID.String()
+
+	exists, err := a.saveState(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -265,7 +322,7 @@ func (a *API) Save(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
 		return
 	}
-	if err := a.DB.InsertSave(ctx, userID, postID); err != nil {
+	if err := a.Redis.SetEngSave(ctx, uid, pid); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -273,6 +330,9 @@ func (a *API) Save(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindInsertSave, UserID: userID, PostID: postID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -286,7 +346,10 @@ func (a *API) Unsave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	exists, err := a.DB.HasSave(ctx, userID, postID)
+	uid := userID.String()
+	pid := postID.String()
+
+	exists, err := a.saveState(ctx, userID, postID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
@@ -299,10 +362,13 @@ func (a *API) Unsave(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := a.DB.DeleteSave(ctx, userID, postID); err != nil {
+	if err := a.Redis.ClearEngSave(ctx, uid, pid); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindDeleteSave, UserID: userID, PostID: postID,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
@@ -316,16 +382,54 @@ func (a *API) Share(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
-	count, err := a.DB.IncrementShare(ctx, postID)
+	uid := userID.String()
+	pid := postID.String()
+
+	memoHit, err := a.Redis.HasShareMemo(ctx, uid, pid)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !memoHit {
+		engHit, err := a.Redis.HasEngShare(ctx, uid, pid)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		memoHit = engHit
+	}
+	if !memoHit {
+		pgHit, err := a.DB.HasShare(ctx, userID, postID)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if pgHit {
+			_ = a.Redis.SetEngShare(ctx, uid, pid)
+			_ = a.Redis.SetShareMemo(ctx, uid, pid, a.Cfg.ShareMemoTTL)
+			writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
+			return
+		}
+	}
+	if memoHit {
+		_ = a.Redis.SetShareMemo(ctx, uid, pid, a.Cfg.ShareMemoTTL)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "unchanged"})
+		return
+	}
+
+	if err := a.Redis.SetEngShare(ctx, uid, pid); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = a.Redis.SetShareMemo(ctx, uid, pid, a.Cfg.ShareMemoTTL)
 	if err := a.applyVector(ctx, userID, postID, "share", false); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "share_count": count})
+	a.Interactions.Enqueue(interactionwriter.Job{
+		Kind: interactionwriter.KindInsertShare, UserID: userID, PostID: postID,
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
 func (a *API) ListComments(w http.ResponseWriter, r *http.Request) {
@@ -373,6 +477,220 @@ func (a *API) CreateComment(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, c)
 }
 
+func appendUnique(dst []db.Post, extras []db.Post, limit int, seen map[uuid.UUID]struct{}) []db.Post {
+	for _, p := range extras {
+		if len(dst) >= limit {
+			break
+		}
+		if _, ok := seen[p.ID]; ok {
+			continue
+		}
+		seen[p.ID] = struct{}{}
+		dst = append(dst, p)
+	}
+	return dst
+}
+
+func uuidsToStrings(ids []uuid.UUID) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		out[i] = id.String()
+	}
+	return out
+}
+
+func stringsToUUIDs(ids []string) []uuid.UUID {
+	out := make([]uuid.UUID, 0, len(ids))
+	for _, s := range ids {
+		id, err := uuid.Parse(s)
+		if err != nil {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func (a *API) ensureSeenLoaded(ctx context.Context, userID uuid.UUID) error {
+	return a.Redis.EnsureSeen(ctx, userID.String(), a.Cfg.SeenTTL, func(ctx context.Context) ([]string, error) {
+		ids, err := a.DB.ListRecentViewedPostIDs(ctx, userID, a.Cfg.SeenHydrateLimit)
+		if err != nil {
+			return nil, err
+		}
+		return uuidsToStrings(ids), nil
+	})
+}
+
+func (a *API) filterUnseenUUIDs(ctx context.Context, userID uuid.UUID, ids []uuid.UUID) ([]uuid.UUID, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	unseen, err := a.Redis.FilterUnseen(ctx, userID.String(), uuidsToStrings(ids))
+	if err != nil {
+		return nil, err
+	}
+	return stringsToUUIDs(unseen), nil
+}
+
+func (a *API) recentUnseenPosts(ctx context.Context, userID uuid.UUID, limit int) ([]db.Post, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	// Over-fetch then filter in Redis to avoid Postgres anti-join on the hot path.
+	fetch := limit * 4
+	if fetch < a.Cfg.QdrantOverfetch {
+		fetch = a.Cfg.QdrantOverfetch
+	}
+	cacheSize := a.Cfg.RecentCacheSize
+	if cacheSize < fetch {
+		cacheSize = fetch
+	}
+
+	var recent []db.Post
+	cached, err := a.Redis.GetRecentIDs(ctx)
+	if err == nil && len(cached) >= fetch {
+		ids := stringsToUUIDs(cached)
+		if len(ids) > fetch {
+			ids = ids[:fetch]
+		}
+		recent, err = a.DB.GetPostsByIDs(ctx, ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(recent) < fetch {
+		recent, err = a.DB.RecentPosts(ctx, cacheSize)
+		if err != nil {
+			return nil, err
+		}
+		idStrs := make([]string, len(recent))
+		for i, p := range recent {
+			idStrs[i] = p.ID.String()
+		}
+		_ = a.Redis.SetRecentIDs(ctx, idStrs, cacheSize, a.Cfg.RecentCacheTTL)
+		if len(recent) > fetch {
+			recent = recent[:fetch]
+		}
+	}
+
+	ids := make([]uuid.UUID, len(recent))
+	byID := make(map[uuid.UUID]db.Post, len(recent))
+	for i, p := range recent {
+		ids[i] = p.ID
+		byID[p.ID] = p
+	}
+	unseen, err := a.filterUnseenUUIDs(ctx, userID, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]db.Post, 0, limit)
+	for _, id := range unseen {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, byID[id])
+	}
+	return out, nil
+}
+
+type scoredHit struct {
+	id     uuid.UUID
+	score  float64
+	vector []float32
+}
+
+func (a *API) multiInterestCandidates(ctx context.Context, interests []vector.Interest) ([]scoredHit, error) {
+	active := vector.ActiveInterests(interests)
+	if len(active) == 0 {
+		return nil, nil
+	}
+
+	best := map[uuid.UUID]scoredHit{}
+	var mu sync.Mutex
+	merge := func(hits []qdrantclient.SearchHit, weight float64) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, h := range hits {
+			id, err := uuid.Parse(h.ID)
+			if err != nil {
+				continue
+			}
+			rel := h.Score * weight
+			if prev, ok := best[id]; ok && prev.score >= rel {
+				continue
+			}
+			best[id] = scoredHit{id: id, score: rel, vector: h.Vector}
+		}
+	}
+
+	if vector.ShouldCollapseInterests(active, a.Cfg.InterestCollinearMin) {
+		q := active[0].Vector
+		w := active[0].Weight
+		if len(active) > 1 {
+			q = vector.BlendInterests(active, a.Cfg.VectorDim)
+			w = 0
+			for _, it := range active {
+				w += it.Weight
+			}
+			if w <= 0 {
+				w = 1
+			}
+		}
+		hits, err := a.Qdrant.Search(ctx, q, a.Cfg.QdrantOverfetch)
+		if err != nil {
+			return nil, err
+		}
+		merge(hits, w)
+	} else {
+		weights := make([]float64, len(active))
+		for i, it := range active {
+			weights[i] = it.Weight
+		}
+		perInterest := a.Cfg.QdrantOverfetch / len(active)
+		minPer := a.Cfg.FeedLimit * 3
+		if perInterest < minPer {
+			perInterest = minPer
+		}
+		totalSlots := perInterest * len(active)
+		if totalSlots < a.Cfg.QdrantOverfetch {
+			totalSlots = a.Cfg.QdrantOverfetch
+		}
+		quotas := vector.AllocateQuotas(weights, totalSlots)
+
+		g, gctx := errgroup.WithContext(ctx)
+		for i, it := range active {
+			if quotas[i] <= 0 || vector.IsZero(it.Vector) {
+				continue
+			}
+			i, it := i, it
+			g.Go(func() error {
+				hits, err := a.Qdrant.Search(gctx, it.Vector, quotas[i])
+				if err != nil {
+					return err
+				}
+				merge(hits, it.Weight)
+				return nil
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]scoredHit, 0, len(best))
+	for _, h := range best {
+		out = append(out, h)
+	}
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].score > out[i].score {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out, nil
+}
+
 func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 	userID, ok := a.requireUser(w, r)
 	if !ok {
@@ -381,15 +699,31 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit := a.Cfg.FeedLimit
 
-	userVec, err := a.Redis.GetUserVector(ctx, userID.String())
-	if err != nil {
+	if err := a.ensureSeenLoaded(ctx, userID); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
+	interests, err := a.Redis.GetUserInterests(ctx, userID.String())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Legacy fallback: single blended vector from before multi-interest.
+	if !vector.HasInterests(interests) {
+		userVec, err := a.Redis.GetUserVector(ctx, userID.String())
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if !vector.IsZero(userVec) {
+			interests = []vector.Interest{{Vector: vector.L2Normalize(userVec), Weight: 1}}
+		}
+	}
+
 	var posts []db.Post
-	if vector.IsZero(userVec) {
-		posts, err = a.DB.RecentUnviewed(ctx, userID, limit)
+	if !vector.HasInterests(interests) {
+		posts, err = a.recentUnseenPosts(ctx, userID, limit)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
@@ -401,97 +735,127 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 				for _, p := range posts {
 					seen[p.ID] = struct{}{}
 				}
-				for _, p := range extra {
-					if _, ok := seen[p.ID]; ok {
-						continue
-					}
-					posts = append(posts, p)
-					if len(posts) >= limit {
-						break
-					}
-				}
+				posts = appendUnique(posts, extra, limit, seen)
 			}
 		}
 	} else {
-		hits, err := a.Qdrant.Search(ctx, userVec, a.Cfg.QdrantOverfetch)
+		hits, err := a.multiInterestCandidates(ctx, interests)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+
 		candidateIDs := make([]uuid.UUID, 0, len(hits))
+		hitByID := make(map[uuid.UUID]scoredHit, len(hits))
 		for _, h := range hits {
-			id, err := uuid.Parse(h.ID)
-			if err != nil {
+			candidateIDs = append(candidateIDs, h.id)
+			hitByID[h.id] = h
+		}
+
+		ranked, err := a.filterUnseenUUIDs(ctx, userID, candidateIDs)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		exploitN, softN, hardN := feedSlots(limit)
+		personalN := exploitN + softN
+
+		mmrIn := make([]vector.MMRCandidate, 0, len(ranked))
+		for _, id := range ranked {
+			h, ok := hitByID[id]
+			if !ok {
 				continue
 			}
-			candidateIDs = append(candidateIDs, id)
+			mmrIn = append(mmrIn, vector.MMRCandidate{
+				ID:        id.String(),
+				Relevance: h.score,
+				Vector:    h.vector,
+			})
 		}
-		filtered, err := a.DB.FilterUnviewed(ctx, userID, candidateIDs, limit)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		posts, err = a.DB.GetPostsByIDs(ctx, filtered)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		// backfill with unviewed recent posts
-		if len(posts) < limit {
-			need := limit - len(posts)
-			extra, err := a.DB.RecentUnviewed(ctx, userID, need+len(posts))
-			if err == nil {
-				seen := map[uuid.UUID]struct{}{}
-				for _, p := range posts {
-					seen[p.ID] = struct{}{}
+
+		used := make(map[uuid.UUID]struct{}, limit)
+		selectedIDs := make([]uuid.UUID, 0, limit)
+		if personalN <= 2 {
+			selectedIDs = append(selectedIDs, pickFromFront(ranked, personalN, used)...)
+		} else {
+			capN := a.Cfg.MMRCandidateCap
+			if capN < 1 {
+				capN = 1
+			}
+			if len(mmrIn) > capN {
+				mmrIn = mmrIn[:capN]
+			}
+			mmrOut := vector.MMR(mmrIn, personalN, a.Cfg.MMRLambda)
+			for _, c := range mmrOut {
+				id, err := uuid.Parse(c.ID)
+				if err != nil {
+					continue
 				}
-				for _, p := range extra {
-					if _, ok := seen[p.ID]; ok {
-						continue
-					}
-					posts = append(posts, p)
-					if len(posts) >= limit {
+				used[id] = struct{}{}
+				selectedIDs = append(selectedIDs, id)
+			}
+		}
+
+		// Soft explore leftover: if MMR under-filled, pull from lower similarity band.
+		if len(selectedIDs) < personalN {
+			need := personalN - len(selectedIDs)
+			selectedIDs = append(selectedIDs, pickSoftExplore(ranked, need, used)...)
+		}
+
+		annSet := make(map[uuid.UUID]struct{}, len(candidateIDs))
+		for _, id := range candidateIDs {
+			annSet[id] = struct{}{}
+		}
+		if hardN > 0 {
+			recent, err := a.recentUnseenPosts(ctx, userID, a.Cfg.QdrantOverfetch)
+			if err == nil {
+				for _, p := range recent {
+					if len(selectedIDs) >= limit {
 						break
 					}
+					if _, ok := used[p.ID]; ok {
+						continue
+					}
+					if _, inANN := annSet[p.ID]; inANN {
+						continue
+					}
+					used[p.ID] = struct{}{}
+					selectedIDs = append(selectedIDs, p.ID)
 				}
 			}
 		}
-		// if still fewer than limit (unviewed exhausted), backfill with vector candidate posts even if viewed
+
+		if len(selectedIDs) < limit {
+			selectedIDs = append(selectedIDs, pickFromFront(ranked, limit-len(selectedIDs), used)...)
+		}
+
+		posts, err = a.DB.GetPostsByIDs(ctx, selectedIDs)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		seen := map[uuid.UUID]struct{}{}
+		for _, p := range posts {
+			seen[p.ID] = struct{}{}
+		}
+		if len(posts) < limit {
+			extra, err := a.recentUnseenPosts(ctx, userID, limit)
+			if err == nil {
+				posts = appendUnique(posts, extra, limit, seen)
+			}
+		}
 		if len(posts) < limit {
 			extra, err := a.DB.GetPostsByIDs(ctx, candidateIDs)
-			if err == nil && len(extra) > 0 {
-				seen := map[uuid.UUID]struct{}{}
-				for _, p := range posts {
-					seen[p.ID] = struct{}{}
-				}
-				for _, p := range extra {
-					if _, ok := seen[p.ID]; ok {
-						continue
-					}
-					posts = append(posts, p)
-					if len(posts) >= limit {
-						break
-					}
-				}
+			if err == nil {
+				posts = appendUnique(posts, extra, limit, seen)
 			}
 		}
-		// if STILL fewer than limit, backfill with recent posts overall
 		if len(posts) < limit {
 			extra, err := a.DB.RecentPosts(ctx, limit)
 			if err == nil {
-				seen := map[uuid.UUID]struct{}{}
-				for _, p := range posts {
-					seen[p.ID] = struct{}{}
-				}
-				for _, p := range extra {
-					if _, ok := seen[p.ID]; ok {
-						continue
-					}
-					posts = append(posts, p)
-					if len(posts) >= limit {
-						break
-					}
-				}
+				posts = appendUnique(posts, extra, limit, seen)
 			}
 		}
 	}
@@ -500,7 +864,11 @@ func (a *API) Feed(w http.ResponseWriter, r *http.Request) {
 	for _, p := range posts {
 		ids = append(ids, p.ID)
 	}
-	_ = a.DB.MarkViewed(ctx, userID, ids)
+	// Hot path: sync Redis seen. Durable PG write is async via bounded workers.
+	_ = a.Redis.MarkSeen(ctx, userID.String(), uuidsToStrings(ids), a.Cfg.SeenTTL)
+	if a.Views != nil {
+		a.Views.Enqueue(userID, ids)
+	}
 
 	type feedPost struct {
 		ID      uuid.UUID `json:"id"`

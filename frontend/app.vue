@@ -14,6 +14,13 @@
         <button class="btn btn-primary" :disabled="creatingUser" @click="onCreateUser">
           Create user
         </button>
+        <button
+          class="btn danger-outline"
+          :disabled="!userId || deletingUser"
+          @click="onDeleteUser"
+        >
+          Delete user
+        </button>
       </div>
     </header>
 
@@ -23,22 +30,45 @@
       Create or select a user to start the infinite recommendation feed.
     </div>
 
-    <div v-else class="feed">
-      <article v-for="post in posts" :key="post.id" class="post">
-        <h2>{{ post.title }}</h2>
-        <div class="content">{{ post.content }}</div>
-        <div class="actions">
-          <button class="btn" :class="{ active: liked[post.id] }" @click="toggleLike(post.id)">Like</button>
-          <button class="btn danger" :class="{ active: disliked[post.id] }" @click="toggleDislike(post.id)">Dislike</button>
-          <button class="btn" :class="{ active: saved[post.id] }" @click="toggleSave(post.id)">Save</button>
-          <button class="btn" @click="sharePost(post.id)">Share</button>
-          <button class="btn" @click="openComments(post)">Comment</button>
-        </div>
-      </article>
+    <div v-else class="main-layout">
+      <div class="feed">
+        <article v-for="post in posts" :key="post.id" class="post">
+          <h2>{{ post.title }}</h2>
+          <div class="content">{{ post.content }}</div>
+          <div class="actions">
+            <button class="btn" :class="{ active: liked[post.id] }" @click="toggleLike(post.id)">Like</button>
+            <button class="btn danger" :class="{ active: disliked[post.id] }" @click="toggleDislike(post.id)">Dislike</button>
+            <button class="btn" :class="{ active: saved[post.id] }" @click="toggleSave(post.id)">Save</button>
+            <button class="btn" @click="sharePost(post.id)">Share</button>
+            <button class="btn" @click="openComments(post)">Comment</button>
+          </div>
+        </article>
 
-      <div ref="sentinel" class="sentinel" />
-      <p v-if="loading" class="status">Loading recommendations…</p>
-      <p v-else-if="exhausted" class="status">No more posts for this user.</p>
+        <div ref="sentinel" class="sentinel" />
+        <p v-if="loading" class="status">Loading recommendations…</p>
+        <p v-else-if="exhausted" class="status">No more posts for this user.</p>
+      </div>
+
+      <aside class="interactions-panel">
+        <header>
+          <h3>Your interactions</h3>
+          <button class="btn" :disabled="ixLoading" @click="refreshInteractions">Refresh</button>
+        </header>
+        <p v-if="ixLoading" class="status">Loading…</p>
+        <template v-else>
+          <section v-for="section in ixSections" :key="section.key" class="ix-section">
+            <h4>{{ section.label }} ({{ section.items.length }})</h4>
+            <div v-if="!section.items.length" class="ix-empty">None yet</div>
+            <ul v-else class="ix-list">
+              <li v-for="(it, i) in section.items" :key="it.id || `${it.post_id}-${i}`">
+                <div class="ix-title">{{ it.title || it.post_id }}</div>
+                <div v-if="it.body" class="ix-body">{{ it.body }}</div>
+                <div class="ix-meta">{{ formatWhen(it.created_at) }}</div>
+              </li>
+            </ul>
+          </section>
+        </template>
+      </aside>
     </div>
 
     <div v-if="commentOpen && commentPost" class="modal-backdrop" @click.self="closeComments">
@@ -65,10 +95,10 @@
 </template>
 
 <script setup lang="ts">
-import type { Comment, Post } from '~/composables/useApi'
+import type { Comment, InteractionItem, MyInteractions, Post } from '~/composables/useApi'
 
 const api = useApi()
-const { userId, users, loadFromStorage, selectUser, refreshUsers, createUser } = useUser()
+const { userId, users, loadFromStorage, selectUser, refreshUsers, createUser, deleteUser } = useUser()
 const { run: debounce } = useDebouncedAction(300)
 
 const posts = ref<Post[]>([])
@@ -77,6 +107,7 @@ const exhausted = ref(false)
 const error = ref('')
 const newUsername = ref('')
 const creatingUser = ref(false)
+const deletingUser = ref(false)
 
 const liked = reactive<Record<string, boolean>>({})
 const disliked = reactive<Record<string, boolean>>({})
@@ -88,28 +119,85 @@ const comments = ref<Comment[]>([])
 const commentBody = ref('')
 const commentLoading = ref(false)
 
+const interactions = ref<MyInteractions | null>(null)
+const ixLoading = ref(false)
+
 const sentinel = ref<HTMLElement | null>(null)
+
+const ixSections = computed(() => {
+  const empty: InteractionItem[] = []
+  const ix = interactions.value
+  return [
+    { key: 'likes', label: 'Likes', items: ix?.likes ?? empty },
+    { key: 'dislikes', label: 'Dislikes', items: ix?.dislikes ?? empty },
+    { key: 'saves', label: 'Saves', items: ix?.saves ?? empty },
+    { key: 'comments', label: 'Comments', items: ix?.comments ?? empty },
+    { key: 'shares', label: 'Shares', items: ix?.shares ?? empty },
+  ]
+})
+
+function formatWhen(iso: string) {
+  try {
+    return new Date(iso).toLocaleString()
+  } catch {
+    return iso
+  }
+}
+
+function clearLocalInteractionState() {
+  Object.keys(liked).forEach(k => delete liked[k])
+  Object.keys(disliked).forEach(k => delete disliked[k])
+  Object.keys(saved).forEach(k => delete saved[k])
+}
+
+async function resetFeedAndLoad() {
+  posts.value = []
+  exhausted.value = false
+  clearLocalInteractionState()
+  if (userId.value) {
+    await Promise.all([loadMore(), refreshInteractions()])
+  } else {
+    interactions.value = null
+  }
+}
+
+async function refreshInteractions() {
+  if (!userId.value) {
+    interactions.value = null
+    return
+  }
+  ixLoading.value = true
+  try {
+    interactions.value = await api.listMyInteractions()
+  } catch (e: any) {
+    error.value = e?.message || 'Failed to load interactions'
+  } finally {
+    ixLoading.value = false
+  }
+}
 
 onMounted(async () => {
   loadFromStorage()
-  if (userId.value && posts.value.length === 0 && !loading.value) {
-    await loadMore()
-  }
   try {
     await refreshUsers()
   } catch (e) {
     error.value = 'Cannot reach API. Is the backend running on :8090?'
   }
+  if (userId.value && posts.value.length === 0 && !loading.value) {
+    await resetFeedAndLoad()
+  }
 })
 
 watch(userId, async (id, prev) => {
-  if (!id || id === prev) return
-  posts.value = []
-  exhausted.value = false
-  Object.keys(liked).forEach(k => delete liked[k])
-  Object.keys(disliked).forEach(k => delete disliked[k])
-  Object.keys(saved).forEach(k => delete saved[k])
-  await loadMore()
+  if (id === prev) return
+  if (!id) {
+    posts.value = []
+    exhausted.value = false
+    clearLocalInteractionState()
+    interactions.value = null
+    return
+  }
+  await resetFeedAndLoad()
 })
 
 async function onCreateUser() {
@@ -119,10 +207,28 @@ async function onCreateUser() {
   try {
     await createUser(newUsername.value)
     newUsername.value = ''
+    await resetFeedAndLoad()
   } catch (e: any) {
     error.value = e?.message || 'Failed to create user'
   } finally {
     creatingUser.value = false
+  }
+}
+
+async function onDeleteUser() {
+  if (!userId.value) return
+  deletingUser.value = true
+  error.value = ''
+  try {
+    await deleteUser(userId.value)
+    posts.value = []
+    exhausted.value = false
+    clearLocalInteractionState()
+    interactions.value = null
+  } catch (e: any) {
+    error.value = e?.message || 'Failed to delete user'
+  } finally {
+    deletingUser.value = false
   }
 }
 
@@ -156,6 +262,10 @@ onMounted(() => {
   }, { immediate: true })
 })
 
+function scheduleIxRefresh() {
+  debounce('ix-refresh', () => refreshInteractions())
+}
+
 function toggleLike(postId: string) {
   const next = !liked[postId]
   liked[postId] = next
@@ -163,6 +273,7 @@ function toggleLike(postId: string) {
   debounce(`like:${postId}`, async () => {
     if (liked[postId]) await api.like(postId)
     else await api.unlike(postId)
+    scheduleIxRefresh()
   })
 }
 
@@ -173,6 +284,7 @@ function toggleDislike(postId: string) {
   debounce(`dislike:${postId}`, async () => {
     if (disliked[postId]) await api.dislike(postId)
     else await api.undislike(postId)
+    scheduleIxRefresh()
   })
 }
 
@@ -182,12 +294,14 @@ function toggleSave(postId: string) {
   debounce(`save:${postId}`, async () => {
     if (saved[postId]) await api.save(postId)
     else await api.unsave(postId)
+    scheduleIxRefresh()
   })
 }
 
 function sharePost(postId: string) {
   debounce(`share:${postId}`, async () => {
     await api.share(postId)
+    scheduleIxRefresh()
   })
 }
 
@@ -217,6 +331,7 @@ async function submitComment() {
   try {
     const c = await api.createComment(commentPost.value.id, body)
     comments.value = [...comments.value, c]
+    scheduleIxRefresh()
   } catch (e: any) {
     error.value = e?.message || 'Failed to comment'
   }
