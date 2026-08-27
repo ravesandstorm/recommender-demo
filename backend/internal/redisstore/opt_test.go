@@ -22,6 +22,7 @@ func TestShareMemo(t *testing.T) {
 	userID := uuid.New().String()
 	postID := uuid.New().String()
 	ttl := time.Hour
+	t.Cleanup(func() { _, _ = rdb.DeleteUserKeys(context.Background(), userID) })
 
 	hit, err := rdb.HasShareMemo(ctx, userID, postID)
 	require.NoError(t, err)
@@ -42,6 +43,7 @@ func TestRecentCache(t *testing.T) {
 	}
 
 	require.NoError(t, rdb.DeleteRecentKey(ctx))
+	t.Cleanup(func() { _ = rdb.DeleteRecentKey(context.Background()) })
 	a, b, c := uuid.New().String(), uuid.New().String(), uuid.New().String()
 	require.NoError(t, rdb.SetRecentIDs(ctx, []string{a, b, c}, 10, time.Hour))
 

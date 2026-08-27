@@ -23,11 +23,15 @@ func TestSeenFilterMarkAndHydrate(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable: %v", err)
 	}
-	defer store.Pool.Close()
+	t.Cleanup(func() { store.Pool.Close() })
 
 	user, err := store.CreateUser(ctx, "seen_"+uuid.New().String()[:8])
 	require.NoError(t, err)
 	userID := user.ID.String()
+	t.Cleanup(func() {
+		_ = store.DeleteUser(context.Background(), user.ID)
+		_, _ = rdb.DeleteUserKeys(context.Background(), userID)
+	})
 	ttl := time.Hour
 
 	a := uuid.New().String()
@@ -51,6 +55,7 @@ func TestSeenFilterMarkAndHydrate(t *testing.T) {
 	// Durable PG row + delete Redis key → hydrate restores filter.
 	post, err := store.InsertPost(ctx, "Seen", "hydrate "+uuid.New().String())
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeletePost(context.Background(), post.ID) })
 	require.NoError(t, store.MarkViewed(ctx, user.ID, []uuid.UUID{post.ID}, cfg.ViewRetainLimit))
 	require.NoError(t, rdb.DeleteSeenKey(ctx, userID))
 

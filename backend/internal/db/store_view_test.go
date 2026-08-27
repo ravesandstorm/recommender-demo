@@ -18,11 +18,12 @@ func TestMarkViewedRetainLimitAndViewCount(t *testing.T) {
 	if err != nil {
 		t.Skipf("postgres unavailable: %v", err)
 	}
-	defer store.Pool.Close()
+	t.Cleanup(func() { store.Pool.Close() })
 	require.NoError(t, migrate.Up(ctx, store.Pool))
 
 	user, err := store.CreateUser(ctx, "retain_"+uuid.New().String()[:8])
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeleteUser(context.Background(), user.ID) })
 
 	const retain = 3
 	var posts []db.Post
@@ -32,6 +33,13 @@ func TestMarkViewedRetainLimitAndViewCount(t *testing.T) {
 		posts = append(posts, p)
 		require.NoError(t, store.MarkViewed(ctx, user.ID, []uuid.UUID{p.ID}, retain))
 	}
+	t.Cleanup(func() {
+		ids := make([]uuid.UUID, len(posts))
+		for i, p := range posts {
+			ids[i] = p.ID
+		}
+		_ = store.DeletePosts(context.Background(), ids)
+	})
 
 	n, err := store.CountUserViews(ctx, user.ID)
 	require.NoError(t, err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/recsys/backend/internal/db"
@@ -28,11 +29,12 @@ type Job struct {
 
 // Writer persists engagement rows to Postgres via a bounded worker pool.
 type Writer struct {
-	db      *db.Store
-	ch      chan Job
-	wg      sync.WaitGroup
-	dropped int64
-	mu      sync.Mutex
+	db          *db.Store
+	ch          chan Job
+	wg          sync.WaitGroup
+	dropped     int64
+	lastDropLog time.Time
+	mu          sync.Mutex
 }
 
 func New(store *db.Store, workers, queueSize int) *Writer {
@@ -99,8 +101,15 @@ func (w *Writer) Enqueue(j Job) {
 		w.mu.Lock()
 		w.dropped++
 		n := w.dropped
+		now := time.Now()
+		shouldLog := now.Sub(w.lastDropLog) >= time.Second
+		if shouldLog {
+			w.lastDropLog = now
+		}
 		w.mu.Unlock()
-		log.Printf("interactionwriter: queue full, dropped job (total dropped=%d)", n)
+		if shouldLog {
+			log.Printf("interactionwriter: queue full, shedding excess jobs (total dropped=%d)", n)
+		}
 	}
 }
 

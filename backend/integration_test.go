@@ -122,6 +122,7 @@ func TestQdrantUpsertSearch(t *testing.T) {
 
 	id := uuid.New().String()
 	require.NoError(t, q.Upsert(ctx, []qdrantclient.UpsertPoint{{ID: id, Vector: vecs[0]}}))
+	t.Cleanup(func() { _ = q.DeletePoints(context.Background(), []string{id}) })
 
 	got, err := q.GetVector(ctx, id)
 	require.NoError(t, err)
@@ -137,6 +138,7 @@ func TestRedisAddSubtractVector(t *testing.T) {
 	ctx := context.Background()
 	rdb := redisstore.New(cfg.RedisAddr, cfg.VectorDim)
 	userID := uuid.New().String()
+	t.Cleanup(func() { _, _ = rdb.DeleteUserKeys(context.Background(), userID) })
 
 	base := vector.Zero(cfg.VectorDim)
 	require.NoError(t, rdb.SetUserVector(ctx, userID, base))
@@ -169,11 +171,12 @@ func TestUsersCreateList(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.New(ctx, cfg.DatabaseURL)
 	require.NoError(t, err)
-	defer store.Pool.Close()
+	t.Cleanup(func() { store.Pool.Close() })
 
 	name := "tester_" + uuid.New().String()[:8]
 	u, err := store.CreateUser(ctx, name)
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeleteUser(context.Background(), u.ID) })
 	require.Equal(t, name, u.Username)
 
 	users, err := store.ListUsers(ctx)
@@ -188,12 +191,114 @@ func TestUsersCreateList(t *testing.T) {
 	require.True(t, found)
 }
 
+func TestDeleteUserCleansPostgresAndRedis(t *testing.T) {
+	cfg := config.Load()
+	ctx := context.Background()
+	store, err := db.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		t.Skipf("postgres unavailable: %v", err)
+	}
+	t.Cleanup(func() { store.Pool.Close() })
+	rdb := redisstore.New(cfg.RedisAddr, cfg.VectorDim)
+	if err := rdb.Ping(ctx); err != nil {
+		t.Skipf("redis unavailable: %v", err)
+	}
+
+	u, err := store.CreateUser(ctx, "del_"+uuid.New().String()[:8])
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = store.DeleteUser(context.Background(), u.ID)
+		_, _ = rdb.DeleteUserKeys(context.Background(), u.ID.String())
+	})
+	post, err := store.InsertPost(ctx, "Del post", "delete user test "+uuid.New().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeletePost(context.Background(), post.ID) })
+	require.NoError(t, store.UpsertLike(ctx, u.ID, post.ID, true))
+	require.NoError(t, rdb.SetUserVector(ctx, u.ID.String(), vector.Zero(cfg.VectorDim)))
+	require.NoError(t, rdb.SetUserInterests(ctx, u.ID.String(), nil))
+	require.NoError(t, rdb.SetEngLike(ctx, u.ID.String(), post.ID.String(), true))
+	require.NoError(t, rdb.SetShareMemo(ctx, u.ID.String(), post.ID.String(), time.Hour))
+
+	require.NoError(t, store.DeleteUser(ctx, u.ID))
+	ok, err := store.UserExists(ctx, u.ID)
+	require.NoError(t, err)
+	require.False(t, ok)
+	_, exists, err := store.GetLike(ctx, u.ID, post.ID)
+	require.NoError(t, err)
+	require.False(t, exists)
+
+	n, err := rdb.DeleteUserKeys(ctx, u.ID.String())
+	require.NoError(t, err)
+	_ = n
+	vec, err := rdb.GetUserVector(ctx, u.ID.String())
+	require.NoError(t, err)
+	require.True(t, vector.IsZero(vec))
+	memo, err := rdb.HasShareMemo(ctx, u.ID.String(), post.ID.String())
+	require.NoError(t, err)
+	require.False(t, memo)
+}
+
+func TestInteractionListsAndRedisEngagement(t *testing.T) {
+	cfg := config.Load()
+	ctx := context.Background()
+	store, err := db.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		t.Skipf("postgres unavailable: %v", err)
+	}
+	t.Cleanup(func() { store.Pool.Close() })
+	rdb := redisstore.New(cfg.RedisAddr, cfg.VectorDim)
+	if err := rdb.Ping(ctx); err != nil {
+		t.Skipf("redis unavailable: %v", err)
+	}
+
+	u, err := store.CreateUser(ctx, "ixlist_"+uuid.New().String()[:8])
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = store.DeleteUser(context.Background(), u.ID)
+		_, _ = rdb.DeleteUserKeys(context.Background(), u.ID.String())
+	})
+	post, err := store.InsertPost(ctx, "List post", "interaction list "+uuid.New().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeletePost(context.Background(), post.ID) })
+
+	require.NoError(t, store.UpsertLike(ctx, u.ID, post.ID, true))
+	require.NoError(t, store.InsertSave(ctx, u.ID, post.ID))
+	_, err = store.InsertComment(ctx, u.ID, post.ID, "hello")
+	require.NoError(t, err)
+	require.NoError(t, rdb.SetEngLike(ctx, u.ID.String(), post.ID.String(), true))
+	require.NoError(t, rdb.SetEngSave(ctx, u.ID.String(), post.ID.String()))
+	require.NoError(t, rdb.SetUserInterests(ctx, u.ID.String(), []vector.Interest{
+		{Vector: vector.L2Normalize([]float32{1, 0, 0}), Weight: 1},
+	}))
+
+	likes, err := store.ListUserLikes(ctx, u.ID)
+	require.NoError(t, err)
+	require.Len(t, likes, 1)
+	require.Equal(t, post.ID, likes[0].PostID)
+
+	saves, err := store.ListUserSaves(ctx, u.ID)
+	require.NoError(t, err)
+	require.Len(t, saves, 1)
+
+	comments, err := store.ListUserComments(ctx, u.ID)
+	require.NoError(t, err)
+	require.Len(t, comments, 1)
+
+	isLike, exists, err := rdb.GetEngLike(ctx, u.ID.String(), post.ID.String())
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.True(t, isLike)
+	interests, err := rdb.GetUserInterests(ctx, u.ID.String())
+	require.NoError(t, err)
+	require.NotEmpty(t, interests)
+}
+
 func TestLikeUndoAndDislikeWeight(t *testing.T) {
 	cfg := config.Load()
 	ctx := context.Background()
 	store, err := db.New(ctx, cfg.DatabaseURL)
 	require.NoError(t, err)
-	defer store.Pool.Close()
+	t.Cleanup(func() { store.Pool.Close() })
 
 	rdb := redisstore.New(cfg.RedisAddr, cfg.VectorDim)
 	q := qdrantclient.New(cfg.QdrantURL, cfg.QdrantCollection, cfg.VectorDim)
@@ -202,10 +307,18 @@ func TestLikeUndoAndDislikeWeight(t *testing.T) {
 
 	user, err := store.CreateUser(ctx, "like_user_"+uuid.New().String()[:8])
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = store.DeleteUser(context.Background(), user.ID)
+		_, _ = rdb.DeleteUserKeys(context.Background(), user.ID.String())
+	})
 	require.NoError(t, rdb.SetUserVector(ctx, user.ID.String(), vector.Zero(cfg.VectorDim)))
 
 	post, err := store.InsertPost(ctx, "Soccer tactics pressing", "Midfield pressing and football recovery goals.")
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = store.DeletePost(context.Background(), post.ID)
+		_ = q.DeletePoints(context.Background(), []string{post.ID.String()})
+	})
 	vecs, err := emb.Embed(ctx, []string{post.Title + "\n" + post.Content})
 	require.NoError(t, err)
 	require.NoError(t, q.Upsert(ctx, []qdrantclient.UpsertPoint{{ID: post.ID.String(), Vector: vecs[0]}}))
@@ -251,15 +364,19 @@ func TestFeedFiltersViewed(t *testing.T) {
 	ctx := context.Background()
 	store, err := db.New(ctx, cfg.DatabaseURL)
 	require.NoError(t, err)
-	defer store.Pool.Close()
+	t.Cleanup(func() { store.Pool.Close() })
 
 	user, err := store.CreateUser(ctx, "feed_user_"+uuid.New().String()[:8])
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeleteUser(context.Background(), user.ID) })
 
 	p1, err := store.InsertPost(ctx, "A", "content a "+uuid.New().String())
 	require.NoError(t, err)
 	p2, err := store.InsertPost(ctx, "B", "content b "+uuid.New().String())
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = store.DeletePosts(context.Background(), []uuid.UUID{p1.ID, p2.ID})
+	})
 
 	require.NoError(t, store.MarkViewed(ctx, user.ID, []uuid.UUID{p1.ID}, cfg.ViewRetainLimit))
 	posts, err := store.RecentUnviewed(ctx, user.ID, 50)

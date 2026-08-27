@@ -1,4 +1,4 @@
-.PHONY: up down api seed frontend test flush flush-prefs
+.PHONY: up down api seed frontend test test-unit test-edge test-integration test-stress test-stress-light test-stress-heavy test-heavy test-go flush flush-prefs
 
 help:
 	@echo "Targets:"
@@ -32,5 +32,26 @@ flush-prefs: ## Wipe user preference vectors, interests, and seen sets
 			done; \
 		done; echo wiped'
 
-test: ## Run backend tests (requires compose services healthy)
+test: ## Run test suite (unit, integration, edge cases & light stress test)
+	cd backend && go run ./cmd/testrunner -scope=all
+
+test-unit: ## Run unit tests with metrics
+	cd backend && go run ./cmd/testrunner -scope=unit
+
+test-edge: ## Run edge case tests with metrics
+	cd backend && go run ./cmd/testrunner -scope=edge-case
+
+test-integration: ## Run end-to-end integration tests with metrics
+	cd backend && go run ./cmd/testrunner -scope=integration
+
+test-stress: ## Run all stress tests (light + heavy load)
+	cd backend && go run ./cmd/testrunner -scope=stress
+
+test-light: ## Run light stress simulation (10 concurrent users fetching 1 feed + interacting)
+	cd backend && go run ./cmd/testrunner -scope=stress-light
+
+test-heavy: ## Run heavy stress saturation test (isolated 200 concurrent users fetching 1 feed)
+	cd backend && go run ./cmd/testrunner -scope=stress-heavy
+
+test-go: ## Run standard native Go tests
 	cd backend && go test ./... -count=1 -timeout 180s

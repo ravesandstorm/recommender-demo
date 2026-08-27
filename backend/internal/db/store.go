@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -109,6 +110,21 @@ func (s *Store) InsertPost(ctx context.Context, title, content string) (Post, er
 		RETURNING id, title, content, share_count, created_at
 	`, title, content).Scan(&p.ID, &p.Title, &p.Content, &p.ShareCount, &p.CreatedAt)
 	return p, err
+}
+
+// DeletePost removes a post; FK CASCADE clears likes/saves/comments/shares/post_views.
+func (s *Store) DeletePost(ctx context.Context, id uuid.UUID) error {
+	_, err := s.Pool.Exec(ctx, `DELETE FROM posts WHERE id=$1`, id)
+	return err
+}
+
+// DeletePosts removes multiple posts in one statement.
+func (s *Store) DeletePosts(ctx context.Context, ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := s.Pool.Exec(ctx, `DELETE FROM posts WHERE id = ANY($1)`, ids)
+	return err
 }
 
 func (s *Store) GetPostsByIDs(ctx context.Context, ids []uuid.UUID) ([]Post, error) {
@@ -226,18 +242,36 @@ func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid
 		retainLimit = 1
 	}
 
+	// Deterministically sort post IDs so concurrent index lock acquisition order is identical
+	sortedIDs := make([]uuid.UUID, len(postIDs))
+	copy(sortedIDs, postIDs)
+	sort.Slice(sortedIDs, func(i, j int) bool {
+		return sortedIDs[i].String() < sortedIDs[j].String()
+	})
+
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
 
+	// Acquire row locks on posts in sorted order first to prevent foreign-key shared lock vs UPDATE deadlocks
+	_, err = tx.Exec(ctx, `
+		SELECT id FROM posts
+		WHERE id = ANY($1)
+		ORDER BY id
+		FOR UPDATE
+	`, sortedIDs)
+	if err != nil {
+		return err
+	}
+
 	rows, err := tx.Query(ctx, `
 		INSERT INTO post_views (user_id, post_id)
 		SELECT $1, x FROM unnest($2::uuid[]) AS x
 		ON CONFLICT DO NOTHING
 		RETURNING post_id
-	`, userID, postIDs)
+	`, userID, sortedIDs)
 	if err != nil {
 		return err
 	}
@@ -256,6 +290,10 @@ func (s *Store) MarkViewed(ctx context.Context, userID uuid.UUID, postIDs []uuid
 	}
 
 	if len(inserted) > 0 {
+		// Sort inserted IDs to acquire row locks in deterministic order and prevent Postgres deadlocks
+		sort.Slice(inserted, func(i, j int) bool {
+			return inserted[i].String() < inserted[j].String()
+		})
 		_, err = tx.Exec(ctx, `
 			UPDATE posts SET view_count = view_count + 1
 			WHERE id = ANY($1)
