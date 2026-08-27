@@ -63,6 +63,18 @@ func WorkersSuite(runner *Runner) []TestCase {
 			Description:   "Asserts interactionwriter drops gracefully without panic or block under burst load",
 			Fn: func(tc *TestContext) {
 				store := runner.GetDB()
+				ctx := tc.Context()
+
+				user, err := store.CreateUser(ctx, "wkr_sat_"+uuid.New().String()[:8])
+				tc.AssertNoError(err, "create user")
+				post, err := store.InsertPost(ctx, "Sat Post", "Saturation test")
+				tc.AssertNoError(err, "create post")
+
+				defer func() {
+					_ = store.DeleteUser(ctx, user.ID)
+					_ = store.DeletePost(ctx, post.ID)
+				}()
+
 				w := interactionwriter.New(store, 1, 1) // minimal queue
 				defer w.Close()
 
@@ -73,8 +85,8 @@ func WorkersSuite(runner *Runner) []TestCase {
 						defer wg.Done()
 						w.Enqueue(interactionwriter.Job{
 							Kind:   interactionwriter.KindUpsertLike,
-							UserID: uuid.New(),
-							PostID: uuid.New(),
+							UserID: user.ID,
+							PostID: post.ID,
 							IsLike: true,
 						})
 					}()

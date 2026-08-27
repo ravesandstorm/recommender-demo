@@ -56,11 +56,18 @@ func TestInteractionWriterDropsWhenFull(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Pool.Close() })
 
+	user, err := store.CreateUser(ctx, "ix_drop_"+uuid.New().String()[:8])
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeleteUser(context.Background(), user.ID) })
+	post, err := store.InsertPost(ctx, "IX Drop", "drop test "+uuid.New().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.DeletePost(context.Background(), post.ID) })
+
 	w := interactionwriter.New(store, 1, 1)
 	defer w.Close()
 	for i := 0; i < 50; i++ {
 		w.Enqueue(interactionwriter.Job{
-			Kind: interactionwriter.KindUpsertLike, UserID: uuid.New(), PostID: uuid.New(), IsLike: true,
+			Kind: interactionwriter.KindUpsertLike, UserID: user.ID, PostID: post.ID, IsLike: true,
 		})
 	}
 	time.Sleep(50 * time.Millisecond)

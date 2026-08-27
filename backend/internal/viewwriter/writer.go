@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/recsys/backend/internal/db"
@@ -16,12 +17,13 @@ type job struct {
 
 // Writer persists feed impressions to Postgres via a bounded worker pool.
 type Writer struct {
-	db           *db.Store
-	ch           chan job
-	wg           sync.WaitGroup
-	dropped      int64
-	mu           sync.Mutex
-	retainLimit  int
+	db          *db.Store
+	ch          chan job
+	wg          sync.WaitGroup
+	dropped     int64
+	lastDropLog time.Time
+	mu          sync.Mutex
+	retainLimit int
 }
 
 func New(store *db.Store, workers, queueSize, retainLimit int) *Writer {
@@ -71,8 +73,15 @@ func (w *Writer) Enqueue(userID uuid.UUID, postIDs []uuid.UUID) {
 		w.mu.Lock()
 		w.dropped++
 		n := w.dropped
+		now := time.Now()
+		shouldLog := now.Sub(w.lastDropLog) >= time.Second
+		if shouldLog {
+			w.lastDropLog = now
+		}
 		w.mu.Unlock()
-		log.Printf("viewwriter: queue full, dropped job (total dropped=%d)", n)
+		if shouldLog {
+			log.Printf("viewwriter: queue full, shedding excess impressions (total dropped=%d)", n)
+		}
 	}
 }
 
