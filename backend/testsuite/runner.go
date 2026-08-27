@@ -118,7 +118,7 @@ func (r *Runner) Run(ctx context.Context, scopeFilter, namePattern string) (*Sui
 	// Filter test cases
 	filtered := make([]TestCase, 0, len(r.cases))
 	for _, tc := range r.cases {
-		if scopeFilter != "" && scopeFilter != "all" {
+		if scopeFilter != "" {
 			if !matchesScope(tc.Scope, scopeFilter) {
 				continue
 			}
@@ -269,6 +269,7 @@ func (r *Runner) runSingle(ctx context.Context, tc TestCase) (res TestResult) {
 		AllocCount: allocCount,
 		Assertions: tctx.assertions,
 	}
+	res.Stress = tctx.stress
 	res.Logs = tctx.logs
 
 	if tctx.skipped {
@@ -288,7 +289,17 @@ func matchesScope(scope Scope, filter string) bool {
 	f := strings.ToLower(filter)
 	s := strings.ToLower(string(scope))
 	if f == "all" {
-		return true
+		// By default, 'all' runs everything EXCEPT heavy stress test
+		return scope != ScopeStressHeavy
+	}
+	if f == "stress" {
+		return strings.HasPrefix(s, "stress/")
+	}
+	if f == "stress-light" || f == "stress_light" || f == "light" {
+		return scope == ScopeStressLight
+	}
+	if f == "stress-heavy" || f == "stress_heavy" || f == "heavy" {
+		return scope == ScopeStressHeavy
 	}
 	if f == "unit" {
 		return strings.HasPrefix(s, "unit/")

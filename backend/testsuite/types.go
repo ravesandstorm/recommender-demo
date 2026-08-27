@@ -18,6 +18,8 @@ const (
 	ScopeHTTPAPI        Scope = "HTTP/API"
 	ScopeIntegrationE2E Scope = "Integration/E2E"
 	ScopeEdgeCases      Scope = "Edge/Boundary"
+	ScopeStressLight    Scope = "Stress/Light"
+	ScopeStressHeavy    Scope = "Stress/Heavy"
 )
 
 // Status represents the outcome of a test.
@@ -58,16 +60,43 @@ type Metrics struct {
 	Assertions int           `json:"assertions"`
 }
 
+// SubsystemBreakdown isolates latency contributions across components.
+type SubsystemBreakdown struct {
+	QdrantAvgMs       float64 `json:"qdrant_ann_avg_ms"`
+	RedisSeenAvgMs    float64 `json:"redis_seen_avg_ms"`
+	MMRAvgMs          float64 `json:"mmr_rerank_avg_ms"`
+	PGFetchAvgMs      float64 `json:"pg_fetch_avg_ms"`
+	VectorUpdateAvgMs float64 `json:"vector_update_avg_ms"`
+}
+
+// StressMetrics records throughput, latency percentiles, and bottleneck telemetry.
+type StressMetrics struct {
+	ConcurrentUsers int                `json:"concurrent_users"`
+	TotalRequests   int                `json:"total_requests"`
+	SuccessfulReqs  int                `json:"successful_requests"`
+	FailedReqs      int                `json:"failed_requests"`
+	ThroughputRPS   float64            `json:"throughput_rps"`
+	P50Ms           float64            `json:"p50_ms"`
+	P95Ms           float64            `json:"p95_ms"`
+	P99Ms           float64            `json:"p99_ms"`
+	MinMs           float64            `json:"min_ms"`
+	MaxMs           float64            `json:"max_ms"`
+	AvgMs           float64            `json:"avg_ms"`
+	Breakdown       SubsystemBreakdown `json:"subsystem_breakdown"`
+	Bottleneck      string             `json:"primary_bottleneck"`
+}
+
 // TestResult encapsulates the outcome and telemetry of a test execution.
 type TestResult struct {
-	Name        string        `json:"name"`
-	Scope       Scope         `json:"scope"`
-	EdgeCase    EdgeCaseTag   `json:"edge_case,omitempty"`
-	Description string        `json:"description"`
-	Status      Status        `json:"status"`
-	Metrics     Metrics       `json:"metrics"`
-	Error       string        `json:"error,omitempty"`
-	Logs        []string      `json:"logs,omitempty"`
+	Name        string         `json:"name"`
+	Scope       Scope          `json:"scope"`
+	EdgeCase    EdgeCaseTag    `json:"edge_case,omitempty"`
+	Description string         `json:"description"`
+	Status      Status         `json:"status"`
+	Metrics     Metrics        `json:"metrics"`
+	Stress      *StressMetrics `json:"stress,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Logs        []string       `json:"logs,omitempty"`
 }
 
 // TestContext provides assertion helpers and logging for test functions.
@@ -79,6 +108,11 @@ type TestContext struct {
 	errMsg     string
 	skipped    bool
 	skipReason string
+	stress     *StressMetrics
+}
+
+func (tc *TestContext) SetStress(sm StressMetrics) {
+	tc.stress = &sm
 }
 
 func NewTestContext(ctx context.Context) *TestContext {

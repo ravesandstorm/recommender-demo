@@ -238,6 +238,43 @@ func (r *Reporter) PrintSummary(summary *SuiteSummary) {
 		}
 	}
 
+	// 4. Stress Testing & Bottleneck Telemetry Section
+	var stressResults []TestResult
+	for _, res := range summary.Results {
+		if res.Stress != nil {
+			stressResults = append(stressResults, res)
+		}
+	}
+	if len(stressResults) > 0 {
+		fmt.Fprintf(r.w, "\n %s\n", r.c(colorBold+colorYellow, "▸ STRESS TESTING & BOTTLENECK TELEMETRY"))
+		fmt.Fprintf(r.w, " %-34s │ %-6s │ %-8s │ %-10s │ %-9s │ %-9s │ %-9s │ %s\n",
+			"STRESS TEST SCENARIO", "USERS", "TOTAL REQ", "THROUGHPUT", "P50 (MED)", "P95", "P99", "PRIMARY BOTTLENECK")
+		fmt.Fprintf(r.w, " %s\n", r.c(colorDim, "───────────────────────────────────┼────────┼──────────┼────────────┼───────────┼───────────┼───────────┼─────────────────────────────────────────────"))
+
+		for _, sr := range stressResults {
+			st := sr.Stress
+			nameStr := fmt.Sprintf("%-34s", sr.Name)
+			usersStr := fmt.Sprintf("%6d", st.ConcurrentUsers)
+			reqsStr := fmt.Sprintf("%8d", st.TotalRequests)
+			rpsStr := fmt.Sprintf("%8.1f RPS", st.ThroughputRPS)
+			p50Str := fmt.Sprintf("%7.2f ms", st.P50Ms)
+			p95Str := fmt.Sprintf("%7.2f ms", st.P95Ms)
+			p99Str := fmt.Sprintf("%7.2f ms", st.P99Ms)
+			bottleneckStr := r.c(colorCyan, st.Bottleneck)
+
+			fmt.Fprintf(r.w, " %s │ %s │ %s │ %s │ %s │ %s │ %s │ %s\n",
+				nameStr,
+				usersStr,
+				reqsStr,
+				rpsStr,
+				p50Str,
+				p95Str,
+				p99Str,
+				bottleneckStr,
+			)
+		}
+	}
+
 	fmt.Fprintf(r.w, "\n%s\n\n", r.c(colorBold+colorCyan, "══════════════════════════════════════════════════════════════════════════════════════════════════════════════"))
 }
 
