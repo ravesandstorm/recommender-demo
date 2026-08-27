@@ -36,11 +36,6 @@ const (
 	colorPurple = "\033[35m"
 	colorCyan   = "\033[36m"
 	colorWhite  = "\033[37m"
-	bgGreen     = "\033[42m\033[30m"
-	bgRed       = "\033[41m\033[37m"
-	bgYellow    = "\033[43m\033[30m"
-	bgBlue      = "\033[44m\033[37m"
-	bgPurple    = "\033[45m\033[37m"
 )
 
 func (r *Reporter) c(color, text string) string {
@@ -51,17 +46,17 @@ func (r *Reporter) c(color, text string) string {
 }
 
 func (r *Reporter) PrintHeader(scopeFilter string, totalTests int) {
-	fmt.Fprintf(r.w, "\n%s\n", r.c(colorBold+colorCyan, "═════════════════════════════════════════════════════════════════════════════════════════════════"))
+	fmt.Fprintf(r.w, "\n%s\n", r.c(colorBold+colorCyan, "══════════════════════════════════════════════════════════════════════════════════════════════════════════════"))
 	fmt.Fprintf(r.w, " %s %s\n", r.c(colorBold+colorWhite, "RECOMMENDATION SYSTEM TEST SUITE & METRICS ENGINE"), r.c(colorDim, "(Go 1.26)"))
 	fmt.Fprintf(r.w, " Target Scope: %s | Total Test Cases: %d | Time: %s\n",
 		r.c(colorBold+colorYellow, scopeFilter),
 		totalTests,
 		r.c(colorDim, time.Now().Format("2006-01-02 15:04:05")),
 	)
-	fmt.Fprintf(r.w, "%s\n", r.c(colorBold+colorCyan, "═════════════════════════════════════════════════════════════════════════════════════════════════"))
-	fmt.Fprintf(r.w, "%-7s │ %-15s │ %-38s │ %-9s │ %-7s │ %-8s │ %s\n",
+	fmt.Fprintf(r.w, "%s\n", r.c(colorBold+colorCyan, "══════════════════════════════════════════════════════════════════════════════════════════════════════════════"))
+	fmt.Fprintf(r.w, " %-6s │ %-15s │ %-38s │ %-11s │ %-7s │ %-9s │ %s\n",
 		"STATUS", "SCOPE", "TEST CASE", "LATENCY", "ASSERTS", "MEMORY", "EDGE CASE / DETAILS")
-	fmt.Fprintf(r.w, "%s\n", r.c(colorDim, "────────┼─────────────────┼────────────────────────────────────────┼───────────┼─────────┼──────────┼───────────────────────────────"))
+	fmt.Fprintf(r.w, "%s\n", r.c(colorDim, "────────┼─────────────────┼────────────────────────────────────────┼─────────────┼─────────┼───────────┼───────────────────────────────"))
 }
 
 func (r *Reporter) PrintResult(res TestResult) {
@@ -82,30 +77,22 @@ func (r *Reporter) PrintResult(res TestResult) {
 	if len(testName) > 38 {
 		testName = testName[:35] + "..."
 	}
+	testNameStr := fmt.Sprintf("%-38s", testName)
 
 	// Format latency with color threshold
 	var latencyStr string
 	if res.Status == StatusSkip {
-		latencyStr = r.c(colorDim, "   -   ")
+		latencyStr = r.c(colorDim, "     -     ")
 	} else if res.Metrics.DurationMs < 1.0 {
-		latencyStr = r.c(colorGreen, fmt.Sprintf("%6.2f ms", res.Metrics.DurationMs))
+		latencyStr = r.c(colorGreen, fmt.Sprintf("%8.2f ms", res.Metrics.DurationMs))
 	} else if res.Metrics.DurationMs < 20.0 {
-		latencyStr = r.c(colorYellow, fmt.Sprintf("%6.2f ms", res.Metrics.DurationMs))
+		latencyStr = r.c(colorYellow, fmt.Sprintf("%8.2f ms", res.Metrics.DurationMs))
 	} else {
-		latencyStr = r.c(colorRed, fmt.Sprintf("%6.2f ms", res.Metrics.DurationMs))
+		latencyStr = r.c(colorRed, fmt.Sprintf("%8.2f ms", res.Metrics.DurationMs))
 	}
 
-	assertsStr := fmt.Sprintf("%5d", res.Metrics.Assertions)
-
-	// Format memory allocated
-	var memStr string
-	if res.Metrics.AllocBytes < 1024 {
-		memStr = fmt.Sprintf("%4d B ", res.Metrics.AllocBytes)
-	} else if res.Metrics.AllocBytes < 1024*1024 {
-		memStr = fmt.Sprintf("%4.1f KB", float64(res.Metrics.AllocBytes)/1024.0)
-	} else {
-		memStr = fmt.Sprintf("%4.1f MB", float64(res.Metrics.AllocBytes)/(1024.0*1024.0))
-	}
+	assertsStr := fmt.Sprintf("%7d", res.Metrics.Assertions)
+	memStr := fmt.Sprintf("%9s", formatBytes(res.Metrics.AllocBytes))
 
 	var details string
 	if res.EdgeCase != "" {
@@ -120,10 +107,10 @@ func (r *Reporter) PrintResult(res TestResult) {
 		details = r.c(colorYellow, fmt.Sprintf("SKIP: %s", res.Error))
 	}
 
-	fmt.Fprintf(r.w, "%-7s │ %s │ %-38s │ %s │ %s │ %8s │ %s\n",
+	fmt.Fprintf(r.w, " %s │ %s │ %s │ %s │ %s │ %s │ %s\n",
 		statusBadge,
 		scopeBadge,
-		testName,
+		testNameStr,
 		latencyStr,
 		assertsStr,
 		memStr,
@@ -138,9 +125,9 @@ func (r *Reporter) PrintResult(res TestResult) {
 }
 
 func (r *Reporter) PrintSummary(summary *SuiteSummary) {
-	fmt.Fprintf(r.w, "\n%s\n", r.c(colorBold+colorCyan, "═════════════════════════════════════════════════════════════════════════════════════════════════"))
+	fmt.Fprintf(r.w, "\n%s\n", r.c(colorBold+colorCyan, "══════════════════════════════════════════════════════════════════════════════════════════════════════════════"))
 	fmt.Fprintf(r.w, " %s\n", r.c(colorBold+colorWhite, "EXECUTIVE TEST & METRICS SUMMARY"))
-	fmt.Fprintf(r.w, "%s\n\n", r.c(colorBold+colorCyan, "═════════════════════════════════════════════════════════════════════════════════════════════════"))
+	fmt.Fprintf(r.w, "%s\n\n", r.c(colorBold+colorCyan, "══════════════════════════════════════════════════════════════════════════════════════════════════════════════"))
 
 	// 1. Overview Banner
 	statusColor := colorGreen
@@ -150,26 +137,30 @@ func (r *Reporter) PrintSummary(summary *SuiteSummary) {
 		statusWord = fmt.Sprintf("%d TEST(S) FAILED", summary.Failed)
 	}
 
-	fmt.Fprintf(r.w, "  ┌─ %s ────────────────────────────────────────────────────────────────────────────┐\n", r.c(colorBold+statusColor, statusWord))
-	fmt.Fprintf(r.w, "  │  Total Tests:    %-6d │ Passed:      %s │ Failed:      %s │ Skipped:     %s │\n",
+	bannerDashCount := 102 - len(statusWord)
+	if bannerDashCount < 2 {
+		bannerDashCount = 2
+	}
+	fmt.Fprintf(r.w, "  ┌─ %s %s┐\n", r.c(colorBold+statusColor, statusWord), strings.Repeat("─", bannerDashCount))
+	fmt.Fprintf(r.w, "  │  Total Tests:  %-6d │ Passed:      %s │ Failed:      %s │ Skipped:     %s │\n",
 		summary.TotalTests,
 		r.c(colorGreen+colorBold, fmt.Sprintf("%-6d", summary.Passed)),
 		r.c(colorRed+colorBold, fmt.Sprintf("%-6d", summary.Failed)),
 		r.c(colorYellow+colorBold, fmt.Sprintf("%-6d", summary.Skipped)),
 	)
-	fmt.Fprintf(r.w, "  │  Pass Rate:      %s │ Total Time:  %-8s │ Total Allocs:%-8d │ Total Mem:   %-8s │\n",
+	fmt.Fprintf(r.w, "  │  Pass Rate:    %-6s │ Total Time:  %-10s │ Total Allocs:%-10d │ Total Mem:   %-8s │\n",
 		r.c(colorBold+colorWhite, fmt.Sprintf("%5.1f%%", summary.PassRate)),
 		summary.TotalDuration.Round(time.Millisecond).String(),
 		summary.TotalAllocs,
 		formatBytes(summary.TotalBytes),
 	)
-	fmt.Fprintf(r.w, "  └────────────────────────────────────────────────────────────────────────────────────────┘\n\n")
+	fmt.Fprintf(r.w, "  └──────────────────────────────────────────────────────────────────────────────────────────────────────┘\n\n")
 
 	// 2. Scope Breakdown Table
 	fmt.Fprintf(r.w, " %s\n", r.c(colorBold+colorYellow, "▸ FUNCTIONAL SCOPE & PERFORMANCE BREAKDOWN"))
-	fmt.Fprintf(r.w, " %-16s │ %-5s │ %-6s │ %-6s │ %-11s │ %-11s │ %-11s │ %s\n",
+	fmt.Fprintf(r.w, " %-16s │ %7s │ %7s │ %7s │ %11s │ %11s │ %11s │ %9s\n",
 		"SCOPE", "TOTAL", "PASSED", "FAILED", "AVG LATENCY", "MAX LATENCY", "ALLOCS", "MEMORY")
-	fmt.Fprintf(r.w, " %s\n", r.c(colorDim, "─────────────────┼───────┼────────┼────────┼─────────────┼─────────────┼─────────────┼──────────"))
+	fmt.Fprintf(r.w, " %s\n", r.c(colorDim, "─────────────────┼─────────┼─────────┼─────────┼─────────────┼─────────────┼─────────────┼───────────"))
 
 	// Sort scopes alphabetically
 	scopes := make([]Scope, 0, len(summary.ScopeStats))
@@ -180,32 +171,38 @@ func (r *Reporter) PrintSummary(summary *SuiteSummary) {
 
 	for _, s := range scopes {
 		st := summary.ScopeStats[s]
-		passBadge := r.c(colorGreen, fmt.Sprintf("%d", st.Passed))
-		failBadge := fmt.Sprintf("%d", st.Failed)
+		scopeStr := r.c(colorPurple, fmt.Sprintf("%-16s", string(s)))
+		totalStr := fmt.Sprintf("%7d", st.Total)
+		passStr := r.c(colorGreen, fmt.Sprintf("%7d", st.Passed))
+		var failStr string
 		if st.Failed > 0 {
-			failBadge = r.c(colorRed+colorBold, failBadge)
+			failStr = r.c(colorRed+colorBold, fmt.Sprintf("%7d", st.Failed))
 		} else {
-			failBadge = r.c(colorDim, failBadge)
+			failStr = r.c(colorDim, fmt.Sprintf("%7d", st.Failed))
 		}
+		avgLatStr := fmt.Sprintf("%8.2f ms", st.AvgDurationMs)
+		maxLatStr := fmt.Sprintf("%8.2f ms", st.MaxDurationMs)
+		allocsStr := fmt.Sprintf("%11d", st.TotalAllocs)
+		memStr := fmt.Sprintf("%9s", formatBytes(st.TotalBytes))
 
-		fmt.Fprintf(r.w, " %-16s │ %5d │ %6s │ %6s │ %8.2f ms │ %8.2f ms │ %11d │ %s\n",
-			r.c(colorPurple, string(s)),
-			st.Total,
-			passBadge,
-			failBadge,
-			st.AvgDurationMs,
-			st.MaxDurationMs,
-			st.TotalAllocs,
-			formatBytes(st.TotalBytes),
+		fmt.Fprintf(r.w, " %s │ %s │ %s │ %s │ %s │ %s │ %s │ %s\n",
+			scopeStr,
+			totalStr,
+			passStr,
+			failStr,
+			avgLatStr,
+			maxLatStr,
+			allocsStr,
+			memStr,
 		)
 	}
 
 	// 3. Edge Case Matrix Table
 	if len(summary.EdgeStats) > 0 {
 		fmt.Fprintf(r.w, "\n %s\n", r.c(colorBold+colorYellow, "▸ EDGE CASE & BOUNDARY CONDITION COVERAGE MATRIX"))
-		fmt.Fprintf(r.w, " %-38s │ %-7s │ %-6s │ %-6s │ %s\n",
-			"EDGE CASE / BOUNDARY CONDITION", "STATUS", "PASS", "FAIL", "COVERAGE VERDICT")
-		fmt.Fprintf(r.w, " %s\n", r.c(colorDim, "───────────────────────────────────────┼─────────┼────────┼────────┼──────────────────────────────────"))
+		fmt.Fprintf(r.w, " %-38s │ %-9s │ %7s │ %7s │ %s\n",
+			"EDGE CASE / BOUNDARY CONDITION", "STATUS", "PASSED", "FAILED", "COVERAGE VERDICT")
+		fmt.Fprintf(r.w, " %s\n", r.c(colorDim, "───────────────────────────────────────┼───────────┼─────────┼─────────┼──────────────────────────────────"))
 
 		edgeTags := make([]EdgeCaseTag, 0, len(summary.EdgeStats))
 		for t := range summary.EdgeStats {
@@ -215,30 +212,33 @@ func (r *Reporter) PrintSummary(summary *SuiteSummary) {
 
 		for _, tag := range edgeTags {
 			es := summary.EdgeStats[tag]
+			tagStr := fmt.Sprintf("%-38s", string(tag))
 			var statusBadge string
 			var verdict string
 			if es.Failed > 0 {
-				statusBadge = r.c(colorRed+colorBold, "FAIL")
+				statusBadge = r.c(colorRed+colorBold, fmt.Sprintf("%-9s", "FAILED"))
 				verdict = r.c(colorRed, fmt.Sprintf("Broken: %d failed cases", es.Failed))
 			} else if es.Passed > 0 {
-				statusBadge = r.c(colorGreen+colorBold, "COVERED")
+				statusBadge = r.c(colorGreen+colorBold, fmt.Sprintf("%-9s", "COVERED"))
 				verdict = r.c(colorGreen, "Protected & Verified")
 			} else {
-				statusBadge = r.c(colorYellow, "SKIPPED")
+				statusBadge = r.c(colorYellow, fmt.Sprintf("%-9s", "SKIPPED"))
 				verdict = r.c(colorYellow, "Skipped due to offline infra")
 			}
+			passStr := fmt.Sprintf("%7d", es.Passed)
+			failStr := fmt.Sprintf("%7d", es.Failed)
 
-			fmt.Fprintf(r.w, " %-38s │ %-7s │ %6d │ %6d │ %s\n",
-				tag,
+			fmt.Fprintf(r.w, " %s │ %s │ %s │ %s │ %s\n",
+				tagStr,
 				statusBadge,
-				es.Passed,
-				es.Failed,
+				passStr,
+				failStr,
 				verdict,
 			)
 		}
 	}
 
-	fmt.Fprintf(r.w, "\n%s\n\n", r.c(colorBold+colorCyan, "═════════════════════════════════════════════════════════════════════════════════════════════════"))
+	fmt.Fprintf(r.w, "\n%s\n\n", r.c(colorBold+colorCyan, "══════════════════════════════════════════════════════════════════════════════════════════════════════════════"))
 }
 
 func (r *Reporter) PrintJSON(summary *SuiteSummary) error {
@@ -258,18 +258,4 @@ func formatBytes(b uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-// Diagnostics checks and prints live service readiness.
-func PrintDiagnostics(w io.Writer, noColor bool, pgURL, redisAddr, qdrantURL, embedURL string) {
-	fmt.Fprintf(w, "  ┌─ System Environment Health Check ──────────────────────────────────────┐\n")
-	fmt.Fprintf(w, "  │ Postgres:   %-57s │\n", pgURL)
-	fmt.Fprintf(w, "  │ Redis:      %-57s │\n", redisAddr)
-	fmt.Fprintf(w, "  │ Qdrant:     %-57s │\n", qdrantURL)
-	fmt.Fprintf(w, "  │ FastEmbed:  %-57s │\n", embedURL)
-	fmt.Fprintf(w, "  └────────────────────────────────────────────────────────────────────────┘\n\n")
-}
-
-func (r *Reporter) HorizontalLine() {
-	fmt.Fprintf(r.w, "%s\n", strings.Repeat("─", 97))
 }
